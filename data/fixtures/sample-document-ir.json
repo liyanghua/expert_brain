@@ -1,0 +1,48 @@
+{
+  "doc_id": "doc_fixture_1",
+  "version_id": "v1",
+  "blocks": [
+    {
+      "block_id": "b1",
+      "block_type": "heading",
+      "text_content": "Incident Response SOP",
+      "heading_level": 1,
+      "source_file": "sample.md",
+      "source_span": "L1",
+      "page_no": null,
+      "sheet_name": null,
+      "node_path": null,
+      "attachment_refs": [],
+      "parent_block_id": null,
+      "children_block_ids": []
+    },
+    {
+      "block_id": "b2",
+      "block_type": "paragraph",
+      "text_content": "Goal: restore service within 30 minutes.",
+      "heading_level": 0,
+      "source_file": "sample.md",
+      "source_span": "L2",
+      "page_no": null,
+      "sheet_name": null,
+      "node_path": null,
+      "attachment_refs": [],
+      "parent_block_id": null,
+      "children_block_ids": []
+    },
+    {
+      "block_id": "b3",
+      "block_type": "table",
+      "text_content": "| Step | Owner |\n| --- | --- |\n| Triage | On-call |",
+      "heading_level": 0,
+      "source_file": "sample.md",
+      "source_span": "L3",
+      "page_no": null,
+      "sheet_name": null,
+      "node_path": null,
+      "attachment_refs": [],
+      "parent_block_id": null,
+      "children_block_ids": []
+    }
+  ]
+}

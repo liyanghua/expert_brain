@@ -1,0 +1,8 @@
+{
+  "id": "structuring.default",
+  "version": "1.0.0",
+  "purpose": "Map Document IR blocks into GroundTruthDraft fields",
+  "input_contract": "Document IR JSON + optional domain profile id",
+  "output_contract": "GroundTruthDraft JSON validated by GroundTruthDraftSchema",
+  "notes": "Runtime copy: packages/agent-core/src/structuring-prompt.ts (blocks include media_uri for page_screenshots). Enable LLM path with EBS_LLM_STRUCTURING=1 and EBS_LLM_API_BASE / EBS_LLM_API_KEY (LiteLLM proxy uses OpenAI-compatible /v1/chat/completions). Validation: GroundTruthDraftSchema before persistence; fallback to rules on failure."
+}

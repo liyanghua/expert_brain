@@ -1,0 +1,32 @@
+{
+  "name": "expert-brain-studio",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "build": "pnpm run build:packages && pnpm run build:apps",
+    "build:packages": "pnpm --filter @ebs/document-ir build && pnpm --filter @ebs/ground-truth-schema build && pnpm --filter @ebs/diff-engine build && pnpm --filter @ebs/storage build && pnpm --filter @ebs/parsing build && pnpm --filter @ebs/suggestions build && pnpm --filter @ebs/extraction-scorecard build && pnpm --filter @ebs/agent-core build && pnpm --filter @ebs/job-runner build && pnpm --filter @ebs/domain-profiles build && pnpm --filter @ebs/ui-components build",
+    "build:apps": "pnpm --filter @ebs/api build && pnpm --filter @ebs/workers build && pnpm --filter @ebs/web build",
+    "dev": "concurrently -n api,web -c blue,green \"pnpm --filter @ebs/api dev\" \"pnpm --filter @ebs/web dev\"",
+    "dev:api": "pnpm --filter @ebs/api dev",
+    "dev:web": "pnpm --filter @ebs/web dev",
+    "dev:worker": "pnpm --filter @ebs/workers dev",
+    "lint": "pnpm run typecheck",
+    "test": "pnpm -r run test",
+    "typecheck": "pnpm -r run typecheck",
+    "validate-schemas": "pnpm exec tsx scripts/dev/validate-schemas.ts",
+    "test:e2e": "pnpm --filter @ebs/web exec playwright test",
+    "eval": "pnpm exec tsx scripts/eval/run-extraction-eval.ts",
+    "eval:docling-ab": "pnpm exec tsx scripts/eval/compare-docling-scorecard.ts"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "@ebs/agent-core": "workspace:*",
+    "@ebs/document-ir": "workspace:*",
+    "@ebs/extraction-scorecard": "workspace:*",
+    "@ebs/ground-truth-schema": "workspace:*",
+    "@ebs/parsing": "workspace:*",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

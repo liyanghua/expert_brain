@@ -1,0 +1,69 @@
+{
+  "schema_name": "BusinessDocStructuredDraft",
+  "schema_version": "v1",
+  "doc_id": "doc_fixture_1",
+  "version_id": "v1",
+  "document_meta": {
+    "document_id": "doc_fixture_1",
+    "title": "Fixture doc",
+    "source_files": ["fixture.pdf"],
+    "version": "v1",
+    "status": "Draft"
+  },
+  "business_scenario": {
+    "content": { "summary": "Incident response" },
+    "status": "Drafted",
+    "confidence": 0.5,
+    "source_refs": [{ "block_id": "b1", "source_file": "fixture.pdf" }]
+  },
+  "scenario_goal": {
+    "content": { "text": "Restore service quickly" },
+    "status": "Drafted",
+    "confidence": 0.4,
+    "source_refs": [{ "block_id": "b2", "source_file": "fixture.pdf" }]
+  },
+  "required_inputs": [],
+  "deliverables": [],
+  "thinking_framework": [],
+  "execution_steps": [],
+  "execution_actions": [],
+  "key_node_rationales": [],
+  "page_screenshots": [],
+  "faq_types": [],
+  "judgment_basis": [],
+  "judgment_criteria": [],
+  "resolution_methods": [],
+  "trigger_conditions": [],
+  "termination_conditions": [],
+  "validation_methods": [],
+  "tool_templates": [],
+  "exceptions_and_non_applicable_scope": [],
+  "gaps_structured": {
+    "missing_fields": [
+      { "field_key": "deliverables", "message": "Add concrete deliverables" }
+    ],
+    "weak_fields": [],
+    "inferred_fields": [],
+    "needs_confirmation_fields": []
+  },
+  "global_scores": {
+    "completeness_score": 0.25,
+    "extraction_confidence_score": 0.35,
+    "grounding_score": 0.9
+  },
+  "gaps": [
+    {
+      "field_key": "deliverables",
+      "severity": "medium",
+      "message": "Add concrete deliverables"
+    }
+  ],
+  "confidence_by_field": {
+    "business_scenario": 0.5,
+    "scenario_goal": 0.4
+  },
+  "source_refs": {
+    "business_scenario": [{ "block_id": "b1" }],
+    "scenario_goal": [{ "block_id": "b2" }]
+  }
+}

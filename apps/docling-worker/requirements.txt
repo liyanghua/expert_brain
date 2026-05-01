@@ -1,0 +1,2 @@
+# Pin Docling for optional worker (pip install -r requirements.txt)
+docling>=2.30.0
