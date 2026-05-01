@@ -24,6 +24,25 @@ describe("normalizeLlmStructuredFields", () => {
     expect(normalized.deliverables).toEqual([item]);
   });
 
+  it("unwraps singleton arrays for schema object fields", () => {
+    const item = {
+      content: { text: "商品诊断" },
+      status: "Drafted",
+      confidence: 0.82,
+      source_refs: [],
+    };
+
+    const normalized = normalizeLlmStructuredFields({
+      business_scenario: [item],
+      scenario_goal: [item],
+      process_flow_or_business_model: [item],
+    });
+
+    expect(normalized.business_scenario).toEqual(item);
+    expect(normalized.scenario_goal).toEqual(item);
+    expect(normalized.process_flow_or_business_model).toEqual(item);
+  });
+
   it("keeps existing arrays intact", () => {
     const item = {
       content: { text: "Validate output" },

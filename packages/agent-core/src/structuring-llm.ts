@@ -63,11 +63,22 @@ export const ARRAY_STRUCTURED_FIELD_KEYS = [
 ] as const satisfies readonly StructuredFieldKey[];
 
 const ARRAY_STRUCTURED_FIELD_KEY_SET = new Set<string>(ARRAY_STRUCTURED_FIELD_KEYS);
+const OBJECT_STRUCTURED_FIELD_KEY_SET = new Set<string>([
+  "business_scenario",
+  "scenario_goal",
+  "process_flow_or_business_model",
+]);
 
 export function normalizeLlmStructuredFields(
   partial: Record<string, unknown>,
 ): Record<string, unknown> {
   const normalized: Record<string, unknown> = { ...partial };
+  for (const key of OBJECT_STRUCTURED_FIELD_KEY_SET) {
+    const v = normalized[key];
+    if (Array.isArray(v) && v.length === 1) {
+      normalized[key] = v[0];
+    }
+  }
   for (const key of ARRAY_STRUCTURED_FIELD_KEY_SET) {
     const v = normalized[key];
     if (v === undefined || v === null || Array.isArray(v)) continue;

@@ -4,11 +4,21 @@ import type { DocumentIR } from "@ebs/document-ir";
 import type {
   DocumentStatus,
   ExpertMemory,
+  ExpertNote,
+  GTCandidate,
   GroundTruthDraft,
   SuggestionRecord,
+  TaskThread,
+  ThreadStep,
   VersionRecord,
 } from "@ebs/ground-truth-schema";
-import { ExpertMemorySchema } from "@ebs/ground-truth-schema";
+import {
+  ExpertMemorySchema,
+  ExpertNoteSchema,
+  GTCandidateSchema,
+  TaskThreadSchema,
+  ThreadStepSchema,
+} from "@ebs/ground-truth-schema";
 
 export type DocumentMeta = {
   doc_id: string;
@@ -102,6 +112,94 @@ export class FileStore {
     } catch {
       return [];
     }
+  }
+
+  listTaskThreads(docId: string): TaskThread[] {
+    const p = join(this.docDir(docId), "threads.json");
+    try {
+      const raw = JSON.parse(readFileSync(p, "utf8")) as unknown[];
+      return raw
+        .map((thread) => TaskThreadSchema.parse(thread))
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    } catch {
+      return [];
+    }
+  }
+
+  upsertTaskThread(docId: string, thread: TaskThread) {
+    const dir = this.docDir(docId);
+    ensureDir(dir);
+    const checked = TaskThreadSchema.parse(thread);
+    const list = this.listTaskThreads(docId);
+    const idx = list.findIndex((item) => item.thread_id === checked.thread_id);
+    if (idx >= 0) list[idx] = checked;
+    else list.push(checked);
+    writeFileSync(join(dir, "threads.json"), JSON.stringify(list, null, 2));
+  }
+
+  appendThreadStep(docId: string, threadId: string, step: ThreadStep): TaskThread {
+    const checked = ThreadStepSchema.parse({ ...step, thread_id: threadId });
+    const list = this.listTaskThreads(docId);
+    const idx = list.findIndex((item) => item.thread_id === threadId);
+    if (idx < 0) {
+      throw new Error(`thread not found: ${threadId}`);
+    }
+    const thread = {
+      ...list[idx]!,
+      latest_step_at: checked.timestamp,
+      steps: [...list[idx]!.steps, checked],
+    };
+    list[idx] = TaskThreadSchema.parse(thread);
+    const dir = this.docDir(docId);
+    ensureDir(dir);
+    writeFileSync(join(dir, "threads.json"), JSON.stringify(list, null, 2));
+    return list[idx]!;
+  }
+
+  listGTCandidates(docId: string): GTCandidate[] {
+    const p = join(this.docDir(docId), "gt_candidates.json");
+    try {
+      const raw = JSON.parse(readFileSync(p, "utf8")) as unknown[];
+      return raw
+        .map((candidate) => GTCandidateSchema.parse(candidate))
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    } catch {
+      return [];
+    }
+  }
+
+  upsertGTCandidate(docId: string, candidate: GTCandidate) {
+    const dir = this.docDir(docId);
+    ensureDir(dir);
+    const checked = GTCandidateSchema.parse(candidate);
+    const list = this.listGTCandidates(docId);
+    const idx = list.findIndex((item) => item.candidate_id === checked.candidate_id);
+    if (idx >= 0) list[idx] = checked;
+    else list.push(checked);
+    writeFileSync(join(dir, "gt_candidates.json"), JSON.stringify(list, null, 2));
+  }
+
+  listExpertNotes(docId: string): ExpertNote[] {
+    const p = join(this.docDir(docId), "expert_notes.json");
+    try {
+      const raw = JSON.parse(readFileSync(p, "utf8")) as unknown[];
+      return raw
+        .map((note) => ExpertNoteSchema.parse(note))
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    } catch {
+      return [];
+    }
+  }
+
+  upsertExpertNote(docId: string, note: ExpertNote) {
+    const dir = this.docDir(docId);
+    ensureDir(dir);
+    const checked = ExpertNoteSchema.parse(note);
+    const list = this.listExpertNotes(docId);
+    const idx = list.findIndex((item) => item.note_id === checked.note_id);
+    if (idx >= 0) list[idx] = checked;
+    else list.push(checked);
+    writeFileSync(join(dir, "expert_notes.json"), JSON.stringify(list, null, 2));
   }
 
   saveImmutableUpload(docId: string, fileId: string, filename: string, buf: Buffer) {

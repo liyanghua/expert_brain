@@ -4,11 +4,13 @@ import {
   type GroundTruthDraft,
   type GroundTruthFieldItem,
   GroundTruthDraftSchema,
+  QuestionRefinementResponseSchema,
   QAResponseSchema,
   type ExpertMemory,
   FIELD_DEFINITIONS_ZH,
   type PublishReadinessResponse,
   type QAResponse,
+  type QuestionRefinementResponse,
   emptyGroundTruthDraft,
   STRUCTURED_FIELD_KEYS,
   type StructuredFieldKey,
@@ -201,18 +203,33 @@ export function runDocQA(input: {
   ir: DocumentIR;
   draft: GroundTruthDraft;
   blockId: string | null;
+  evidenceBlockIds?: string[];
   question: string;
+  questionSeed?: string | null;
+  gapReason?: string | null;
   targetField?: string | null;
 }): QAResponse {
-  const block = input.blockId
-    ? input.ir.blocks.find((b) => b.block_id === input.blockId)
-    : undefined;
-  const ctx = block?.text_content ?? "(no block selected)";
+  const blockIds = [
+    ...new Set([...(input.evidenceBlockIds ?? []), input.blockId].filter(Boolean)),
+  ] as string[];
+  const blocks = blockIds
+    .map((blockId) => input.ir.blocks.find((b) => b.block_id === blockId))
+    .filter((block): block is DocumentIR["blocks"][number] => Boolean(block));
+  const ctx = blocks.length
+    ? blocks
+        .map((block) => `[${block.block_id} ${block.block_type}]\n${block.text_content}`)
+        .join("\n\n")
+    : "(no block selected)";
+  const refinedQuestion =
+    input.questionSeed && input.questionSeed !== input.question
+      ? `${input.questionSeed}\n结合目标字段 ${input.targetField ?? "未指定"} 和缺口原因 ${input.gapReason ?? "未指定"} 回答。`
+      : input.question;
   return {
-    direct_answer: `针对「${input.question}」，当前选中内容摘要：${ctx.slice(0, 500)}`,
+    refined_question: refinedQuestion,
+    direct_answer: `针对「${refinedQuestion}」，当前证据摘要：${ctx.slice(0, 1000)}`,
     rationale:
-      "基于 Document IR 中的 block 文本与 GroundTruthDraft 上下文生成的占位回答（可接入 LLM）。",
-    source_block_refs: block ? [block.block_id] : [],
+      "基于 Document IR 中的多个证据 block、目标字段与 GroundTruthDraft 上下文生成的占位回答（可接入 LLM）。",
+    source_block_refs: blocks.map((block) => block.block_id),
     next_step_suggestion: "可请求改写建议或映射到结构化字段。",
     target_field: input.targetField ?? null,
     suggested_writeback: input.targetField
@@ -224,15 +241,114 @@ export function runDocQA(input: {
   };
 }
 
-function relatedDraftForBlock(draft: GroundTruthDraft, blockId: string | null) {
-  if (!blockId) return [];
+function evidenceBlocksForInput(input: {
+  ir: DocumentIR;
+  blockId: string | null;
+  evidenceBlockIds?: string[];
+}): DocumentBlock[] {
+  const evidenceBlockIds = [
+    ...new Set([...(input.evidenceBlockIds ?? []), input.blockId].filter(Boolean)),
+  ] as string[];
+  return evidenceBlockIds
+    .map((blockId) => input.ir.blocks.find((b) => b.block_id === blockId))
+    .filter((block): block is DocumentIR["blocks"][number] => Boolean(block));
+}
+
+function buildFallbackQuestionRefinement(input: {
+  ir: DocumentIR;
+  blockId: string | null;
+  evidenceBlockIds?: string[];
+  questionSeed?: string | null;
+  gapReason?: string | null;
+  targetField?: string | null;
+}): QuestionRefinementResponse {
+  const evidenceBlocks = evidenceBlocksForInput(input);
+  const fieldLabel = input.targetField
+    ? FIELD_DEFINITIONS_ZH[input.targetField as StructuredFieldKey]?.label ??
+      input.targetField
+    : "当前字段";
+  const seed =
+    input.questionSeed?.trim() ||
+    `请基于当前证据补充“${fieldLabel}”的专家判断。`;
+  const gap = input.gapReason?.trim() || "缺少明确的专家补充说明";
+  const contextSummary = evidenceBlocks
+    .map((block) => `[${block.block_id} ${block.block_type}] ${block.text_content}`)
+    .join("\n\n")
+    .slice(0, 1200);
+  return {
+    refined_question: `${seed} 请结合已选原文证据，说明“${fieldLabel}”应补充哪些判断依据、业务规则或可回写内容。`,
+    context_summary: contextSummary || "暂无已选证据 block。",
+    source_block_refs: evidenceBlocks.map((block) => block.block_id),
+    rationale: `根据目标字段“${fieldLabel}”和缺口原因“${gap}”生成，供专家确认后再提交给 QA Agent。`,
+  };
+}
+
+export async function runQuestionRefinementAsync(input: {
+  ir: DocumentIR;
+  draft: GroundTruthDraft;
+  blockId: string | null;
+  evidenceBlockIds?: string[];
+  questionSeed?: string | null;
+  gapReason?: string | null;
+  targetField?: string | null;
+  metric?: string | null;
+  expertMemory?: ExpertMemory;
+}): Promise<QuestionRefinementResponse> {
+  const fallback = () => buildFallbackQuestionRefinement(input);
+  if (process.env.EBS_LLM_QA?.trim() === "0") return fallback();
+
+  const evidenceBlocks = evidenceBlocksForInput(input);
+  const related = relatedDraftForBlocks(
+    input.draft,
+    evidenceBlocks.map((block) => block.block_id),
+  );
+  const system = `你是 Expert Brain Studio 的问题改写 Agent。你只负责把系统推荐追问、原文证据、目标字段和 GAP 原因改写成一个专家可确认的问题草稿，不回答问题。
+使用中文，问题要具体、友好、可回写导向。
+结合专家画像：${JSON.stringify(input.expertMemory?.profile ?? {})}
+输出 JSON，字段：
+- refined_question: 改写后的问题草稿
+- context_summary: 证据摘要，不超过 300 字
+- source_block_refs: 使用到的 block_id 数组
+- rationale: 为什么这样改写`;
+  const user = JSON.stringify(
+    {
+      recommended_question: input.questionSeed,
+      target_field: input.targetField,
+      gap_reason: input.gapReason,
+      low_score_metric: input.metric,
+      evidence_blocks: evidenceBlocks.map((block) => ({
+        block_id: block.block_id,
+        block_type: block.block_type,
+        text_content: block.text_content,
+        source_span: block.source_span,
+      })),
+      related_structured_items: related,
+    },
+    null,
+    2,
+  );
+  try {
+    const timeoutMs = Number(process.env.EBS_LLM_QA_TIMEOUT_MS ?? 30_000);
+    const raw = await chatCompletionText({ system, user, timeoutMs });
+    const parsed = JSON.parse(raw.trim()) as unknown;
+    const checked = QuestionRefinementResponseSchema.safeParse(parsed);
+    if (checked.success) return checked.data;
+    return fallback();
+  } catch {
+    return fallback();
+  }
+}
+
+function relatedDraftForBlocks(draft: GroundTruthDraft, blockIds: string[]) {
+  if (blockIds.length === 0) return [];
+  const blockIdSet = new Set(blockIds);
   const related: { field_key: string; content: unknown; status?: string }[] = [];
   for (const key of STRUCTURED_FIELD_KEYS) {
     const raw = draft[key];
     const items = Array.isArray(raw) ? raw : raw ? [raw] : [];
     for (const item of items) {
       const refs = item.source_refs ?? [];
-      if (refs.some((r) => r.block_id === blockId)) {
+      if (refs.some((r) => r.block_id && blockIdSet.has(r.block_id))) {
         related.push({
           field_key: key,
           content: item.content,
@@ -248,7 +364,10 @@ export async function runDocQAAsync(input: {
   ir: DocumentIR;
   draft: GroundTruthDraft;
   blockId: string | null;
+  evidenceBlockIds?: string[];
   question: string;
+  questionSeed?: string | null;
+  gapReason?: string | null;
   targetField?: string | null;
   metric?: string | null;
   expertMemory?: ExpertMemory;
@@ -258,20 +377,26 @@ export async function runDocQAAsync(input: {
       ir: input.ir,
       draft: input.draft,
       blockId: input.blockId,
+      evidenceBlockIds: input.evidenceBlockIds,
       question: input.question,
+      questionSeed: input.questionSeed,
+      gapReason: input.gapReason,
       targetField: input.targetField,
     });
   if (process.env.EBS_LLM_QA?.trim() === "0") return fallback();
 
-  const block = input.blockId
-    ? input.ir.blocks.find((b) => b.block_id === input.blockId)
-    : undefined;
-  const related = relatedDraftForBlock(input.draft, input.blockId);
+  const evidenceBlocks = evidenceBlocksForInput(input);
+  const related = relatedDraftForBlocks(
+    input.draft,
+    evidenceBlocks.map((block) => block.block_id),
+  );
   const system = `你是 Expert Brain Studio 的 QA Agent。你要帮助行业专家提升结构化文档质量。
 使用中文回答。回答必须精准、可追溯、可回写。
 结合专家画像：${JSON.stringify(input.expertMemory?.profile ?? {})}
 专家近期修正偏好：${JSON.stringify(input.expertMemory?.correction_summaries ?? [])}
+你需要先基于 recommended_question、evidence_blocks、target_field 和 gap_reason，在内部生成一个更具体的业务问题 refined_question，然后再回答。
 输出 JSON，字段：
+- refined_question: 你基于推荐追问和证据生成的具体业务问题
 - direct_answer: 直接答案
 - rationale: 推理依据，说明引用了哪些原文和结构化字段
 - source_block_refs: 字符串数组
@@ -281,16 +406,16 @@ export async function runDocQAAsync(input: {
   const user = JSON.stringify(
     {
       question: input.question,
+      recommended_question: input.questionSeed ?? input.question,
       target_field: input.targetField,
+      gap_reason: input.gapReason,
       low_score_metric: input.metric,
-      selected_block: block
-        ? {
-            block_id: block.block_id,
-            block_type: block.block_type,
-            text_content: block.text_content,
-            source_span: block.source_span,
-          }
-        : null,
+      evidence_blocks: evidenceBlocks.map((block) => ({
+        block_id: block.block_id,
+        block_type: block.block_type,
+        text_content: block.text_content,
+        source_span: block.source_span,
+      })),
       related_structured_items: related,
       document_context: input.ir.blocks.slice(0, 40).map((b) => ({
         block_id: b.block_id,

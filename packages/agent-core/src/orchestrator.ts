@@ -10,6 +10,7 @@ import { heuristicSuggestionsForBlock } from "@ebs/suggestions";
 import {
   evaluatePublishReadiness,
   runDocQAAsync,
+  runQuestionRefinementAsync,
   runDocQA,
   runGapDetection,
   runStructuring,
@@ -54,12 +55,29 @@ export class AgentOrchestrator {
     ir: DocumentIR;
     draft: GroundTruthDraft;
     blockId: string | null;
+    evidenceBlockIds?: string[];
     question: string;
+    questionSeed?: string | null;
+    gapReason?: string | null;
     targetField?: string | null;
     metric?: string | null;
     expertMemory?: ExpertMemory;
   }) {
     return runDocQAAsync(input);
+  }
+
+  async runA2QuestionRefinementAsync(input: {
+    ir: DocumentIR;
+    draft: GroundTruthDraft;
+    blockId: string | null;
+    evidenceBlockIds?: string[];
+    questionSeed?: string | null;
+    gapReason?: string | null;
+    targetField?: string | null;
+    metric?: string | null;
+    expertMemory?: ExpertMemory;
+  }) {
+    return runQuestionRefinementAsync(input);
   }
 
   runA3Suggestions(ir: DocumentIR, blockId: string): SuggestionRecord[] {

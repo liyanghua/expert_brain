@@ -307,8 +307,99 @@ export const VersionRecordSchema = z.object({
 
 export type VersionRecord = z.infer<typeof VersionRecordSchema>;
 
+export const ThreadStepTypeSchema = z.enum([
+  "task_started",
+  "question_suggested",
+  "question_edited",
+  "question_sent",
+  "agent_answered",
+  "note_saved",
+  "gt_candidate_created",
+  "writeback_confirmed",
+  "writeback_rejected",
+  "task_completed",
+]);
+
+export type ThreadStepType = z.infer<typeof ThreadStepTypeSchema>;
+
+export const ThreadStepSchema = z.object({
+  step_id: z.string().min(1),
+  thread_id: z.string().min(1),
+  type: ThreadStepTypeSchema,
+  timestamp: z.string().datetime(),
+  payload: z.record(z.unknown()).default({}),
+});
+
+export type ThreadStep = z.infer<typeof ThreadStepSchema>;
+
+export const TaskThreadStatusSchema = z.enum([
+  "active",
+  "waiting_user",
+  "completed",
+  "archived",
+]);
+
+export type TaskThreadStatus = z.infer<typeof TaskThreadStatusSchema>;
+
+export const TaskThreadSchema = z.object({
+  thread_id: z.string().min(1),
+  doc_id: z.string().min(1),
+  version_id: z.string().min(1),
+  task_id: z.string().min(1),
+  field_key: z.string().nullable().optional(),
+  status: TaskThreadStatusSchema.default("active"),
+  title: z.string(),
+  source_block_ids: z.array(z.string()).default([]),
+  recommended_question: z.string().optional(),
+  created_at: z.string().datetime(),
+  latest_step_at: z.string().datetime(),
+  steps: z.array(ThreadStepSchema).default([]),
+});
+
+export type TaskThread = z.infer<typeof TaskThreadSchema>;
+
+export const GTCandidateStatusSchema = z.enum([
+  "draft",
+  "confirmed",
+  "rejected",
+  "edited",
+]);
+
+export type GTCandidateStatus = z.infer<typeof GTCandidateStatusSchema>;
+
+export const GTCandidateSchema = z.object({
+  candidate_id: z.string().min(1),
+  thread_id: z.string().nullable().optional(),
+  doc_id: z.string().min(1),
+  version_id: z.string().min(1),
+  field_key: z.string().min(1),
+  content: z.unknown(),
+  source_refs: z.array(SourceRefSchema).default([]),
+  status: GTCandidateStatusSchema.default("draft"),
+  recommended_mode: z.enum(["append", "replace"]).default("append"),
+  created_from_step_id: z.string().nullable().optional(),
+  rationale: z.string().optional(),
+  created_at: z.string().datetime(),
+  updated_at: z.string().datetime(),
+});
+
+export type GTCandidate = z.infer<typeof GTCandidateSchema>;
+
+export const ExpertNoteSchema = z.object({
+  note_id: z.string().min(1),
+  doc_id: z.string().min(1),
+  thread_id: z.string().nullable().optional(),
+  content: z.string().min(1),
+  source_block_ids: z.array(z.string()).default([]),
+  created_at: z.string().datetime(),
+  updated_at: z.string().datetime(),
+});
+
+export type ExpertNote = z.infer<typeof ExpertNoteSchema>;
+
 /** AGENTS §15.1 */
 export const QAResponseSchema = z.object({
+  refined_question: z.string().optional(),
   direct_answer: z.string(),
   rationale: z.string(),
   source_block_refs: z.array(z.string()).default([]),
@@ -323,6 +414,17 @@ export const QAResponseSchema = z.object({
 });
 
 export type QAResponse = z.infer<typeof QAResponseSchema>;
+
+export const QuestionRefinementResponseSchema = z.object({
+  refined_question: z.string(),
+  context_summary: z.string(),
+  source_block_refs: z.array(z.string()).default([]),
+  rationale: z.string(),
+});
+
+export type QuestionRefinementResponse = z.infer<
+  typeof QuestionRefinementResponseSchema
+>;
 
 /** AGENTS §15.2 */
 export const SuggestionResponseSchema = z.object({

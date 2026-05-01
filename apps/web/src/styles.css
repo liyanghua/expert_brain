@@ -252,6 +252,56 @@ textarea {
   background: rgba(62, 207, 142, 0.08);
 }
 
+.quality-inline-panel {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(91, 140, 255, 0.28);
+  border-radius: 12px;
+  background:
+    linear-gradient(135deg, rgba(91, 140, 255, 0.12), rgba(62, 207, 142, 0.06)),
+    #0c0f14;
+}
+
+.quality-inline-header {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.quality-inline-header p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quality-inline-panel.compact .llm-diagnostics {
+  display: none;
+}
+
+.quality-inline-panel.running .llm-pulse {
+  background: var(--accent2);
+  animation: llm-pulse 1.2s infinite;
+}
+
+.quality-inline-panel.success .llm-pulse {
+  background: var(--accent2);
+}
+
+.quality-inline-panel.error .llm-pulse {
+  background: var(--warn);
+}
+
+.question-refine-panel {
+  margin-top: 10px;
+  border-color: rgba(62, 207, 142, 0.28);
+  background:
+    linear-gradient(135deg, rgba(62, 207, 142, 0.12), rgba(91, 140, 255, 0.06)),
+    #0c0f14;
+}
+
 .focus-actions {
   display: flex;
   gap: 8px;
@@ -286,8 +336,135 @@ textarea {
   line-height: 1.35;
 }
 
-.chat-context-strip {
+.studio-panel {
+  display: grid;
+  gap: 10px;
   margin-bottom: 10px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.studio-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.studio-tabs button.active {
+  border-color: var(--accent2);
+  color: var(--accent2);
+  background: rgba(62, 207, 142, 0.08);
+}
+
+.studio-body {
+  display: grid;
+  gap: 8px;
+}
+
+.studio-summary,
+.gt-candidate-card header,
+.thread-card header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+}
+
+.studio-summary span,
+.gt-candidate-card small,
+.thread-card small {
+  color: var(--muted);
+}
+
+.gt-candidate-card,
+.thread-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #0c0f14;
+}
+
+.gt-candidate-card textarea,
+.note-composer textarea {
+  min-height: 72px;
+  font-size: 12px;
+}
+
+.candidate-confirmed,
+.candidate-edited {
+  border-color: rgba(62, 207, 142, 0.35);
+}
+
+.candidate-rejected {
+  opacity: 0.65;
+}
+
+.note-composer {
+  display: grid;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.thread-card > header span {
+  display: block;
+  color: var(--accent2);
+  font-size: 11px;
+}
+
+.thread-recommendation,
+.thread-candidate-hint {
+  padding: 7px 8px;
+  border-radius: 10px;
+  color: var(--accent2);
+  background: rgba(62, 207, 142, 0.08);
+  font-size: 12px;
+}
+
+.thread-steps {
+  display: grid;
+  gap: 7px;
+}
+
+.thread-step {
+  display: grid;
+  gap: 3px;
+  padding-left: 10px;
+  border-left: 2px solid rgba(91, 140, 255, 0.45);
+}
+
+.thread-step span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.thread-step p {
+  margin: 0;
+  line-height: 1.4;
+}
+
+.chat-context-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.chat-context-strip span {
+  max-width: 100%;
+  padding: 5px 8px;
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 12px;
 }
 
 .chat-context-strip button {
@@ -365,7 +542,13 @@ textarea {
 }
 
 .qa-actions small {
+  display: block;
   color: var(--muted);
+}
+
+.refined-question {
+  margin-bottom: 4px;
+  color: var(--accent2) !important;
 }
 
 .field-grid {

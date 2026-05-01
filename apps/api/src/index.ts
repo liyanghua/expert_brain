@@ -12,16 +12,23 @@ import {
   computeExtractionScorecard,
 } from "@ebs/extraction-scorecard";
 import {
+  GTCandidateSchema,
   GroundTruthDraftSchema,
   STRUCTURED_FIELD_KEYS,
+  TaskThreadSchema,
+  ThreadStepSchema,
+  ExpertNoteSchema,
   assertTransition,
 } from "@ebs/ground-truth-schema";
 import type {
   DocumentStatus,
+  GTCandidate,
   GroundTruthDraft,
   GroundTruthFieldItem,
   SourceRef,
   StructuredFieldKey,
+  TaskThread,
+  ThreadStepType,
 } from "@ebs/ground-truth-schema";
 import { structuredDiff, textDiff } from "@ebs/diff-engine";
 import { processParseJobs } from "@ebs/job-runner";
@@ -122,6 +129,145 @@ function applyFieldItem(
   (next as Record<string, unknown>)[fieldKey] =
     mode === "replace" ? [item] : [...list, item];
   return GroundTruthDraftSchema.parse(next);
+}
+
+function evidenceBlockIdsFromBody(
+  body: Record<string, unknown>,
+  ir: DocumentIR,
+): string[] {
+  return Array.isArray(body.evidence_block_ids)
+    ? body.evidence_block_ids.filter(
+        (blockId: unknown): blockId is string =>
+          typeof blockId === "string" &&
+          ir.blocks.some((block) => block.block_id === blockId),
+      )
+    : [];
+}
+
+function isoNow() {
+  return new Date().toISOString();
+}
+
+function bodyString(body: Record<string, unknown>, key: string): string | null {
+  const value = body[key];
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function threadTitleForField(fieldKey: string | null, fallback: string) {
+  return fieldKey && isStructuredFieldKey(fieldKey)
+    ? `补充${fieldKey}`
+    : fallback;
+}
+
+function createTaskThread(input: {
+  docId: string;
+  versionId: string;
+  fieldKey?: string | null;
+  sourceBlockIds?: string[];
+  recommendedQuestion?: string | null;
+  title?: string | null;
+}): TaskThread {
+  const now = isoNow();
+  const fieldKey = input.fieldKey ?? null;
+  return TaskThreadSchema.parse({
+    thread_id: randomUUID(),
+    doc_id: input.docId,
+    version_id: input.versionId,
+    task_id: fieldKey ? `task-${fieldKey}` : `task-${randomUUID().slice(0, 8)}`,
+    field_key: fieldKey,
+    status: "active",
+    title:
+      input.title ??
+      threadTitleForField(fieldKey, "推进当前证据的专家问答"),
+    source_block_ids: input.sourceBlockIds ?? [],
+    recommended_question: input.recommendedQuestion ?? undefined,
+    created_at: now,
+    latest_step_at: now,
+    steps: [
+      {
+        step_id: randomUUID(),
+        thread_id: "pending",
+        type: "task_started",
+        timestamp: now,
+        payload: {
+          field_key: fieldKey,
+          source_block_ids: input.sourceBlockIds ?? [],
+        },
+      },
+    ],
+  });
+}
+
+function ensureThread(
+  docId: string,
+  versionId: string,
+  body: Record<string, unknown>,
+  options: {
+    fieldKey?: string | null;
+    sourceBlockIds?: string[];
+    recommendedQuestion?: string | null;
+    title?: string | null;
+  },
+): TaskThread {
+  const threadId = bodyString(body, "thread_id");
+  const existing = threadId
+    ? store.listTaskThreads(docId).find((thread) => thread.thread_id === threadId)
+    : undefined;
+  if (existing) return existing;
+  const thread = createTaskThread({
+    docId,
+    versionId,
+    fieldKey: options.fieldKey,
+    sourceBlockIds: options.sourceBlockIds,
+    recommendedQuestion: options.recommendedQuestion,
+    title: options.title,
+  });
+  const fixed = {
+    ...thread,
+    steps: thread.steps.map((step) => ({
+      ...step,
+      thread_id: thread.thread_id,
+    })),
+  };
+  store.upsertTaskThread(docId, fixed);
+  return fixed;
+}
+
+function appendThreadStep(
+  docId: string,
+  threadId: string | null | undefined,
+  type: ThreadStepType,
+  payload: Record<string, unknown>,
+) {
+  if (!threadId) return null;
+  try {
+    return store.appendThreadStep(
+      docId,
+      threadId,
+      ThreadStepSchema.parse({
+        step_id: randomUUID(),
+        thread_id: threadId,
+        type,
+        timestamp: isoNow(),
+        payload,
+      }),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function candidateText(candidate: GTCandidate): string {
+  const content = candidate.content;
+  if (
+    content &&
+    typeof content === "object" &&
+    "text" in content &&
+    typeof (content as { text?: unknown }).text === "string"
+  ) {
+    return (content as { text: string }).text;
+  }
+  return typeof content === "string" ? content : JSON.stringify(content);
 }
 
 function compareScorecards(
@@ -379,6 +525,248 @@ app.patch("/documents/:docId/expert-memory", async (c) => {
   return c.json(store.readExpertMemory(docId));
 });
 
+app.get("/documents/:docId/threads", async (c) => {
+  return c.json({ threads: store.listTaskThreads(c.req.param("docId")) });
+});
+
+app.post("/documents/:docId/threads", async (c) => {
+  const docId = c.req.param("docId");
+  const meta = store.readMeta(docId);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const thread = createTaskThread({
+    docId,
+    versionId: meta.current_version_id,
+    fieldKey: bodyString(body, "field_key"),
+    sourceBlockIds: Array.isArray(body.source_block_ids)
+      ? body.source_block_ids.filter((id): id is string => typeof id === "string")
+      : [],
+    recommendedQuestion: bodyString(body, "recommended_question"),
+    title: bodyString(body, "title"),
+  });
+  const checked = TaskThreadSchema.parse({
+    ...thread,
+    steps: thread.steps.map((step) => ({
+      ...step,
+      thread_id: thread.thread_id,
+    })),
+  });
+  store.upsertTaskThread(docId, checked);
+  return c.json(checked);
+});
+
+app.post("/documents/:docId/threads/:threadId/steps", async (c) => {
+  const docId = c.req.param("docId");
+  const threadId = c.req.param("threadId");
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const type = bodyString(body, "type");
+  if (!type) return c.json({ error: "missing step type" }, 400);
+  const step = ThreadStepSchema.safeParse({
+    step_id: randomUUID(),
+    thread_id: threadId,
+    type,
+    timestamp: isoNow(),
+    payload:
+      typeof body.payload === "object" && body.payload
+        ? (body.payload as Record<string, unknown>)
+        : {},
+  });
+  if (!step.success) return c.json({ error: "invalid step" }, 400);
+  const thread = store.appendThreadStep(docId, threadId, step.data);
+  return c.json(thread);
+});
+
+app.get("/documents/:docId/gt-candidates", async (c) => {
+  return c.json({ candidates: store.listGTCandidates(c.req.param("docId")) });
+});
+
+app.post("/documents/:docId/gt-candidates", async (c) => {
+  const docId = c.req.param("docId");
+  const meta = store.readMeta(docId);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const fieldKey = bodyString(body, "field_key");
+  if (!fieldKey || !isStructuredFieldKey(fieldKey)) {
+    return c.json({ error: "invalid field_key" }, 400);
+  }
+  const now = isoNow();
+  const candidate = GTCandidateSchema.parse({
+    candidate_id: randomUUID(),
+    thread_id: bodyString(body, "thread_id"),
+    doc_id: docId,
+    version_id: meta.current_version_id,
+    field_key: fieldKey,
+    content: body.content ?? { text: String(body.text ?? "") },
+    source_refs: sourceRefsFromBody(body),
+    status: "draft",
+    recommended_mode: body.mode === "replace" ? "replace" : "append",
+    created_from_step_id: bodyString(body, "created_from_step_id"),
+    rationale: bodyString(body, "rationale") ?? "专家问答生成的 GroundTruth 候选",
+    created_at: now,
+    updated_at: now,
+  });
+  store.upsertGTCandidate(docId, candidate);
+  appendThreadStep(docId, candidate.thread_id, "gt_candidate_created", {
+    candidate_id: candidate.candidate_id,
+    field_key: candidate.field_key,
+  });
+  return c.json(candidate);
+});
+
+app.post("/documents/:docId/gt-candidates/:candidateId/reject", async (c) => {
+  const docId = c.req.param("docId");
+  const candidateId = c.req.param("candidateId");
+  const candidate = store
+    .listGTCandidates(docId)
+    .find((item) => item.candidate_id === candidateId);
+  if (!candidate) return c.json({ error: "not found" }, 404);
+  const next = GTCandidateSchema.parse({
+    ...candidate,
+    status: "rejected",
+    updated_at: isoNow(),
+  });
+  store.upsertGTCandidate(docId, next);
+  appendThreadStep(docId, next.thread_id, "writeback_rejected", {
+    candidate_id: candidateId,
+  });
+  return c.json(next);
+});
+
+app.post("/documents/:docId/gt-candidates/:candidateId/confirm", async (c) => {
+  const docId = c.req.param("docId");
+  const candidateId = c.req.param("candidateId");
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const meta = store.readMeta(docId);
+  const candidate = store
+    .listGTCandidates(docId)
+    .find((item) => item.candidate_id === candidateId);
+  if (!candidate) return c.json({ error: "not found" }, 404);
+  if (!isStructuredFieldKey(candidate.field_key)) {
+    return c.json({ error: "invalid field_key" }, 400);
+  }
+  const answerText =
+    bodyString(body, "edited_text") ?? bodyString(body, "answer_text") ?? candidateText(candidate);
+  const draft = store.readDraft(docId, meta.current_version_id);
+  const item: GroundTruthFieldItem = {
+    content: { text: answerText, from_gt_candidate: candidateId },
+    status: "Drafted",
+    confidence: 0.78,
+    source_refs: candidate.source_refs,
+    notes: `GT 候选确认：${candidate.rationale ?? candidateId}`,
+  };
+  const nextDraft = applyFieldItem(
+    draft,
+    candidate.field_key,
+    item,
+    body.mode === "replace" || candidate.recommended_mode === "replace"
+      ? "replace"
+      : "append",
+  );
+  store.writeDraft(docId, meta.current_version_id, nextDraft);
+  const nextCandidate = GTCandidateSchema.parse({
+    ...candidate,
+    content: item.content,
+    status: bodyString(body, "edited_text") ? "edited" : "confirmed",
+    updated_at: isoNow(),
+  });
+  store.upsertGTCandidate(docId, nextCandidate);
+  meta.document_status = "Revised";
+  meta.audit.push({
+    at: isoNow(),
+    action: "gt_candidate_confirmed",
+    detail: candidateId,
+  });
+  store.writeMeta(meta);
+  appendThreadStep(docId, candidate.thread_id, "writeback_confirmed", {
+    candidate_id: candidateId,
+    field_key: candidate.field_key,
+  });
+  const ir = tryReadIR(docId, meta.current_version_id);
+  const scorecard = ir ? computeExtractionScorecard({ draft: nextDraft, ir }) : null;
+  const improvement_plan =
+    scorecard && ir ? buildImprovementPlan(scorecard, nextDraft, ir) : null;
+  return c.json({
+    candidate: nextCandidate,
+    draft: nextDraft,
+    scorecard,
+    improvement_plan,
+  });
+});
+
+app.get("/documents/:docId/notes", async (c) => {
+  return c.json({ notes: store.listExpertNotes(c.req.param("docId")) });
+});
+
+app.post("/documents/:docId/notes", async (c) => {
+  const docId = c.req.param("docId");
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const content = bodyString(body, "content");
+  if (!content) return c.json({ error: "empty note" }, 400);
+  const now = isoNow();
+  const note = ExpertNoteSchema.parse({
+    note_id: randomUUID(),
+    doc_id: docId,
+    thread_id: bodyString(body, "thread_id"),
+    content,
+    source_block_ids: Array.isArray(body.source_block_ids)
+      ? body.source_block_ids.filter((id): id is string => typeof id === "string")
+      : [],
+    created_at: now,
+    updated_at: now,
+  });
+  store.upsertExpertNote(docId, note);
+  appendThreadStep(docId, note.thread_id, "note_saved", {
+    note_id: note.note_id,
+    content: note.content,
+  });
+  return c.json(note);
+});
+
+app.post("/documents/:docId/qa/refine-question", async (c) => {
+  const docId = c.req.param("docId");
+  const meta = store.readMeta(docId);
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const ir = tryReadIR(docId, meta.current_version_id);
+  if (!ir) {
+    return c.json(irNotReadyPayload(docId, meta.current_version_id), 409);
+  }
+  let draft = await safeDraft(docId, meta.current_version_id);
+  if (!draft) {
+    const r = await orchestrator.runA1StructuringAsync(ir);
+    draft = r.draft;
+    store.writeDraft(docId, meta.current_version_id, draft);
+  }
+  const targetField =
+    typeof body.target_field === "string" ? body.target_field : null;
+  const evidenceBlockIds = evidenceBlockIdsFromBody(body, ir);
+  const blockId =
+    evidenceBlockIds[0] ?? (typeof body.block_id === "string" ? body.block_id : null);
+  const refined = await orchestrator.runA2QuestionRefinementAsync({
+    ir,
+    draft,
+    blockId,
+    evidenceBlockIds,
+    questionSeed:
+      typeof body.question_seed === "string" ? body.question_seed : null,
+    gapReason: typeof body.gap_reason === "string" ? body.gap_reason : null,
+    targetField,
+    metric: typeof body.metric === "string" ? body.metric : null,
+    expertMemory: store.readExpertMemory(docId),
+  });
+  const thread = ensureThread(docId, meta.current_version_id, body, {
+    fieldKey: targetField,
+    sourceBlockIds: evidenceBlockIds,
+    recommendedQuestion:
+      typeof body.question_seed === "string" ? body.question_seed : refined.refined_question,
+    title: targetField ? `追问${targetField}` : "生成专家追问",
+  });
+  appendThreadStep(docId, thread.thread_id, "question_suggested", {
+    recommended_question: body.question_seed,
+    refined_question: refined.refined_question,
+    source_block_refs: refined.source_block_refs,
+    rationale: refined.rationale,
+  });
+  return c.json({ ...refined, thread_id: thread.thread_id });
+});
+
 app.post("/documents/:docId/qa", async (c) => {
   const docId = c.req.param("docId");
   const meta = store.readMeta(docId);
@@ -395,15 +783,64 @@ app.post("/documents/:docId/qa", async (c) => {
   }
   const targetField =
     typeof body.target_field === "string" ? body.target_field : null;
+  const evidenceBlockIds = evidenceBlockIdsFromBody(body, ir);
+  const blockId =
+    evidenceBlockIds[0] ?? (typeof body.block_id === "string" ? body.block_id : null);
   const qa = await orchestrator.runA2QAAsync({
     ir,
     draft,
-    blockId: typeof body.block_id === "string" ? body.block_id : null,
+    blockId,
+    evidenceBlockIds,
     question: typeof body.question === "string" ? body.question : "",
+    questionSeed:
+      typeof body.question_seed === "string" ? body.question_seed : null,
+    gapReason: typeof body.gap_reason === "string" ? body.gap_reason : null,
     targetField,
     metric: typeof body.metric === "string" ? body.metric : null,
     expertMemory: store.readExpertMemory(docId),
   });
+  const thread = ensureThread(docId, meta.current_version_id, body, {
+    fieldKey: targetField ?? qa.target_field,
+    sourceBlockIds: evidenceBlockIds,
+    recommendedQuestion:
+      typeof body.question_seed === "string" ? body.question_seed : qa.refined_question,
+    title: targetField ? `回答${targetField}` : "专家问答线程",
+  });
+  appendThreadStep(docId, thread.thread_id, "question_sent", {
+    question: typeof body.question === "string" ? body.question : "",
+    question_seed: typeof body.question_seed === "string" ? body.question_seed : null,
+  });
+  appendThreadStep(docId, thread.thread_id, "agent_answered", {
+    answer: qa.direct_answer,
+    rationale: qa.rationale,
+    source_block_refs: qa.source_block_refs,
+    target_field: qa.target_field,
+  });
+  let gtCandidate: GTCandidate | null = null;
+  const candidateField = qa.suggested_writeback?.field_key ?? qa.target_field;
+  if (candidateField && isStructuredFieldKey(candidateField)) {
+    const now = isoNow();
+    gtCandidate = GTCandidateSchema.parse({
+      candidate_id: randomUUID(),
+      thread_id: thread.thread_id,
+      doc_id: docId,
+      version_id: meta.current_version_id,
+      field_key: candidateField,
+      content: qa.suggested_writeback?.content ?? { text: qa.direct_answer },
+      source_refs: qa.source_block_refs.map((blockId) => ({ block_id: blockId })),
+      status: "draft",
+      recommended_mode: "append",
+      created_from_step_id: null,
+      rationale: qa.rationale,
+      created_at: now,
+      updated_at: now,
+    });
+    store.upsertGTCandidate(docId, gtCandidate);
+    appendThreadStep(docId, thread.thread_id, "gt_candidate_created", {
+      candidate_id: gtCandidate.candidate_id,
+      field_key: gtCandidate.field_key,
+    });
+  }
   const memory = store.readExpertMemory(docId);
   store.writeExpertMemory(docId, {
     ...memory,
@@ -412,7 +849,7 @@ app.post("/documents/:docId/qa", async (c) => {
       ...memory.recent_questions,
     ].filter(Boolean).slice(0, 20),
   });
-  return c.json(qa);
+  return c.json({ ...qa, thread_id: thread.thread_id, gt_candidate: gtCandidate });
 });
 
 app.post("/documents/:docId/qa/apply", async (c) => {
@@ -473,6 +910,12 @@ app.post("/documents/:docId/qa/apply", async (c) => {
   const scorecard = ir ? computeExtractionScorecard({ draft: next, ir }) : null;
   const improvement_plan =
     scorecard && ir ? buildImprovementPlan(scorecard, next, ir) : null;
+  const threadId = bodyString(body, "thread_id");
+  appendThreadStep(docId, threadId, "writeback_confirmed", {
+    field_key: fieldKey,
+    answer_text: answerText.trim(),
+    mode: body.mode === "replace" ? "replace" : "append",
+  });
   return c.json({
     draft: next,
     field_key: fieldKey,
