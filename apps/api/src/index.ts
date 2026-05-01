@@ -449,15 +449,17 @@ app.post("/documents/:docId/qa/apply", async (c) => {
   );
   store.writeDraft(docId, meta.current_version_id, next);
   meta.document_status = "Revised";
-  meta.audit.push({
+  const auditEntry = {
     at: new Date().toISOString(),
     action: "qa_answer_applied",
     detail: JSON.stringify({
       field_key: fieldKey,
       question: body.question,
       edited: typeof body.edited_text === "string",
+      mode: body.mode === "replace" ? "replace" : "append",
     }),
-  });
+  };
+  meta.audit.push(auditEntry);
   store.writeMeta(meta);
   const memory = store.readExpertMemory(docId);
   store.writeExpertMemory(docId, {
@@ -467,7 +469,19 @@ app.post("/documents/:docId/qa/apply", async (c) => {
       ...memory.correction_summaries,
     ].slice(0, 20),
   });
-  return c.json({ draft: next, field_key: fieldKey });
+  const ir = tryReadIR(docId, meta.current_version_id);
+  const scorecard = ir ? computeExtractionScorecard({ draft: next, ir }) : null;
+  const improvement_plan =
+    scorecard && ir ? buildImprovementPlan(scorecard, next, ir) : null;
+  return c.json({
+    draft: next,
+    field_key: fieldKey,
+    updated_field: fieldKey,
+    updated_item: item,
+    audit_entry: auditEntry,
+    scorecard,
+    improvement_plan,
+  });
 });
 
 app.patch("/documents/:docId/draft", async (c) => {

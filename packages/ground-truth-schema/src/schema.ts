@@ -162,6 +162,88 @@ export const GROUND_TRUTH_FIELD_KEYS = STRUCTURED_FIELD_KEYS;
 export type StructuredFieldKey = (typeof STRUCTURED_FIELD_KEYS)[number];
 export type GroundTruthFieldKey = StructuredFieldKey;
 
+export const FIELD_DEFINITIONS_ZH = {
+  business_scenario: {
+    label: "业务场景",
+    gap_guidance: "需要专家补充这个文档适用的具体业务场景、对象和使用边界。",
+  },
+  scenario_goal: {
+    label: "场景目标",
+    gap_guidance: "需要专家补充该流程希望达成的业务目标或判断结果。",
+  },
+  required_inputs: {
+    label: "前置输入与依赖",
+    gap_guidance: "需要专家补充执行前必须具备的数据、页面、权限、角色或资料。",
+  },
+  deliverables: {
+    label: "输出成果",
+    gap_guidance: "需要专家补充完成该流程后应该产出的结论、表格、动作或报告。",
+  },
+  process_flow_or_business_model: {
+    label: "流程或业务模型",
+    gap_guidance: "需要专家补充从输入到输出的主要流程、业务链路或模型框架。",
+  },
+  thinking_framework: {
+    label: "思考框架",
+    gap_guidance: "需要专家补充分析问题时采用的维度、分类方式和判断路径。",
+  },
+  execution_steps: {
+    label: "执行步骤",
+    gap_guidance: "需要专家补充具体操作步骤，以及步骤之间的先后顺序。",
+  },
+  execution_actions: {
+    label: "执行动作",
+    gap_guidance: "需要专家补充每一步对应的实际动作、处理方式或落地操作。",
+  },
+  key_node_rationales: {
+    label: "关键节点判断理由",
+    gap_guidance: "需要专家补充关键节点为什么这样判断、这样操作的业务理由。",
+  },
+  page_screenshots: {
+    label: "页面截图或证据截图",
+    gap_guidance: "需要专家补充相关页面截图、证据截图或可定位的页面信息。",
+  },
+  faq_types: {
+    label: "常见问题类型",
+    gap_guidance: "需要专家补充该场景下常见的问题分类、异常类型或咨询类型。",
+  },
+  judgment_basis: {
+    label: "判断依据",
+    gap_guidance: "需要专家补充做出判断时参考的数据、页面信息、业务规则或事实依据。",
+  },
+  judgment_criteria: {
+    label: "判断标准",
+    gap_guidance: "需要专家补充什么情况下判定为正常、异常、通过或不通过。",
+  },
+  resolution_methods: {
+    label: "处理方法",
+    gap_guidance: "需要专家补充发现问题后的处理动作、解决路径和责任分工。",
+  },
+  trigger_conditions: {
+    label: "触发条件",
+    gap_guidance: "需要专家补充什么情况下启动该流程或进入该判断节点。",
+  },
+  termination_conditions: {
+    label: "终止条件",
+    gap_guidance: "需要专家补充什么情况下流程结束、无需继续处理或转入其他流程。",
+  },
+  validation_methods: {
+    label: "验证方法",
+    gap_guidance: "需要专家补充如何验证处理结果有效，包括检查口径和验收方式。",
+  },
+  tool_templates: {
+    label: "工具与模板",
+    gap_guidance: "需要专家补充执行该流程需要使用的工具、模板、表单或链接。",
+  },
+  exceptions_and_non_applicable_scope: {
+    label: "例外与不适用范围",
+    gap_guidance: "需要专家补充哪些情况不适用该流程，以及例外处理方式。",
+  },
+} satisfies Record<
+  StructuredFieldKey,
+  { label: string; gap_guidance: string }
+>;
+
 export const GroundTruthDraftSchema = z.object({
   schema_name: z.literal("BusinessDocStructuredDraft").optional(),
   schema_version: z.string().optional(),

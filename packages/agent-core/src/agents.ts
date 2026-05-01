@@ -6,6 +6,7 @@ import {
   GroundTruthDraftSchema,
   QAResponseSchema,
   type ExpertMemory,
+  FIELD_DEFINITIONS_ZH,
   type PublishReadinessResponse,
   type QAResponse,
   emptyGroundTruthDraft,
@@ -63,6 +64,11 @@ function groundingScore(draft: GroundTruthDraft): number {
     }
   }
   return total === 0 ? 1 : grounded / total;
+}
+
+function gapMessageForField(key: StructuredFieldKey): string {
+  const definition = FIELD_DEFINITIONS_ZH[key];
+  return `缺少“${definition.label}”：${definition.gap_guidance}`;
 }
 
 /** A1 — rule-based MVP structuring (LLM can replace internals later). */
@@ -144,7 +150,7 @@ export function runStructuring(ir: DocumentIR): GroundTruthDraft {
       gaps.push({
         field_key: key,
         severity: "medium",
-        message: `Field ${key} needs expert input`,
+        message: gapMessageForField(key),
       });
     }
   }
@@ -296,7 +302,8 @@ export async function runDocQAAsync(input: {
     2,
   );
   try {
-    const raw = await chatCompletionText({ system, user });
+    const timeoutMs = Number(process.env.EBS_LLM_QA_TIMEOUT_MS ?? 30_000);
+    const raw = await chatCompletionText({ system, user, timeoutMs });
     const parsed = JSON.parse(raw.trim()) as unknown;
     const checked = QAResponseSchema.safeParse(parsed);
     if (checked.success) return checked.data;
