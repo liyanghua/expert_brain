@@ -112,6 +112,49 @@ export const GapsStructuredSchema = z.object({
 
 export type GapsStructured = z.infer<typeof GapsStructuredSchema>;
 
+export const GlobalQualityGapSchema = z.object({
+  field_key: z.string().optional(),
+  severity: z.enum(["low", "medium", "high"]).default("medium"),
+  message: z.string(),
+  source_refs: z.array(SourceRefSchema).default([]),
+});
+
+export type GlobalQualityGap = z.infer<typeof GlobalQualityGapSchema>;
+
+export const GlobalQualityRecommendedTaskSchema = z.object({
+  task_id: z.string().optional(),
+  title: z.string(),
+  reason: z.string(),
+  question: z.string(),
+  target_field: z.string().optional(),
+  source_block_ids: z.array(z.string()).default([]),
+  priority: z.enum(["low", "medium", "high"]).default("medium"),
+});
+
+export type GlobalQualityRecommendedTask = z.infer<
+  typeof GlobalQualityRecommendedTaskSchema
+>;
+
+export const GlobalQualitySuggestedQuestionSchema = z.object({
+  question: z.string(),
+  target_field: z.string().optional(),
+  source_block_ids: z.array(z.string()).default([]),
+});
+
+export type GlobalQualitySuggestedQuestion = z.infer<
+  typeof GlobalQualitySuggestedQuestionSchema
+>;
+
+export const GlobalQualityTriageSchema = z.object({
+  summary: z.string(),
+  major_gaps: z.array(GlobalQualityGapSchema).default([]),
+  recommended_tasks: z.array(GlobalQualityRecommendedTaskSchema).default([]),
+  suggested_questions: z.array(GlobalQualitySuggestedQuestionSchema).default([]),
+  source_refs: z.array(SourceRefSchema).default([]),
+});
+
+export type GlobalQualityTriage = z.infer<typeof GlobalQualityTriageSchema>;
+
 export const DocumentMetaDraftSchema = z.object({
   document_id: z.string(),
   title: z.string().optional(),
@@ -397,6 +440,21 @@ export const ExpertNoteSchema = z.object({
 
 export type ExpertNote = z.infer<typeof ExpertNoteSchema>;
 
+export const LlmCallDiagnosticsSchema = z.object({
+  label: z.string(),
+  provider: z.string(),
+  model: z.string(),
+  timeout_ms: z.number(),
+  system_prompt_chars: z.number(),
+  user_prompt_chars: z.number(),
+  elapsed_ms: z.number().optional(),
+  status: z.enum(["ok", "failed", "skipped"]).default("ok"),
+  reason: z.string().optional(),
+  message: z.string().optional(),
+});
+
+export type LlmCallDiagnostics = z.infer<typeof LlmCallDiagnosticsSchema>;
+
 /** AGENTS §15.1 */
 export const QAResponseSchema = z.object({
   refined_question: z.string().optional(),
@@ -411,6 +469,7 @@ export const QAResponseSchema = z.object({
       content: z.unknown(),
     })
     .optional(),
+  llm_diagnostics: LlmCallDiagnosticsSchema.optional(),
 });
 
 export type QAResponse = z.infer<typeof QAResponseSchema>;
@@ -420,6 +479,7 @@ export const QuestionRefinementResponseSchema = z.object({
   context_summary: z.string(),
   source_block_refs: z.array(z.string()).default([]),
   rationale: z.string(),
+  llm_diagnostics: LlmCallDiagnosticsSchema.optional(),
 });
 
 export type QuestionRefinementResponse = z.infer<

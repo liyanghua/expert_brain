@@ -1,6 +1,7 @@
 import type { DocumentIR } from "@ebs/document-ir";
 import type {
   ExpertMemory,
+  GlobalQualityTriage,
   GroundTruthDraft,
   SuggestionRecord,
   VersionActionResponse,
@@ -17,9 +18,13 @@ import {
 } from "./agents.js";
 import type {
   StructuringDiagnostics,
+  GlobalQualityTriageMode,
   StructuringMode,
 } from "./structuring-llm.js";
-import { runStructuringWithLlmOrFallback } from "./structuring-llm.js";
+import {
+  runGlobalQualityTriageWithLlmOrFallback,
+  runStructuringWithLlmOrFallback,
+} from "./structuring-llm.js";
 
 export type AgentMode =
   | "QA"
@@ -39,6 +44,14 @@ export class AgentOrchestrator {
     diagnostics: StructuringDiagnostics;
   }> {
     return runStructuringWithLlmOrFallback(ir);
+  }
+
+  async runA1GlobalQualityTriageAsync(ir: DocumentIR): Promise<{
+    triage: GlobalQualityTriage;
+    triage_mode: GlobalQualityTriageMode;
+    diagnostics: StructuringDiagnostics;
+  }> {
+    return runGlobalQualityTriageWithLlmOrFallback(ir);
   }
 
   runA2QA(

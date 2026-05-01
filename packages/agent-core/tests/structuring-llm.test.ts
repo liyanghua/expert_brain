@@ -1,10 +1,92 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { emptyGroundTruthDraft } from "@ebs/ground-truth-schema";
+import type { DocumentIR } from "@ebs/document-ir";
+import { chatCompletionText } from "../src/llm-client.js";
+import {
+  buildCompactDocumentContext,
+  buildGlobalQualityTriagePromptInput,
+} from "../src/structuring-prompt.js";
 import {
   ARRAY_STRUCTURED_FIELD_KEYS,
   collectDraftQualityIssues,
   normalizeLlmStructuredFields,
+  runGlobalQualityTriageWithLlmOrFallback,
+  runStructuringWithLlmOrFallback,
 } from "../src/structuring-llm.js";
+
+vi.mock("../src/llm-client.js", () => ({
+  chatCompletionText: vi.fn(async () => {
+    throw new Error("TimeoutError: structuring request timed out");
+  }),
+  resolveLlmRequestConfig: vi.fn((opts: { label?: string; timeoutMs?: number }) => ({
+    provider: "deepseek",
+    base: "https://api.deepseek.com/v1",
+    apiKey: "test-key",
+    model:
+      opts.label === "structuring.global_triage"
+        ? "deepseek-v4-flash"
+        : "deepseek-v4-pro",
+    timeoutMs: opts.timeoutMs ?? 30000,
+    responseJson: true,
+    label: opts.label ?? "chat.completions",
+    route:
+      opts.label === "structuring.global_triage" ? "triage" : "default",
+  })),
+}));
+
+afterEach(() => {
+  vi.clearAllMocks();
+  delete process.env.EBS_LLM_STRUCTURING;
+  delete process.env.EBS_LLM_STRUCTURING_TIMEOUT_MS;
+  delete process.env.DASHSCOPE_API_KEY;
+  delete process.env.DASHSCOPE_MODEL;
+});
+
+function sampleIr(text = "普通业务流程 目标 输入 输出 执行动作"): DocumentIR {
+  return {
+    doc_id: "doc-timeout",
+    version_id: "v1",
+    blocks: [
+      {
+        block_id: "b1",
+        block_type: "paragraph",
+        text_content: text,
+        heading_level: 0,
+        source_file: "doc.md",
+        page_no: null,
+        sheet_name: null,
+        node_path: null,
+        attachment_refs: [],
+        parent_block_id: null,
+        children_block_ids: [],
+      },
+    ],
+  };
+}
+
+function sampleLargeIr(): DocumentIR {
+  return {
+    doc_id: "doc-large",
+    version_id: "v1",
+    blocks: Array.from({ length: 12 }, (_, index) => ({
+      block_id: `b${index + 1}`,
+      block_type: index % 5 === 0 ? "heading" : "paragraph",
+      text_content:
+        index === 6
+          ? "判断标准：" + "转化率和加购率需要结合生命周期判断。".repeat(60)
+          : `普通段落 ${index + 1}`,
+      heading_level: index % 5 === 0 ? 1 : 0,
+      source_file: "large.md",
+      source_span: `L${index + 1}`,
+      page_no: null,
+      sheet_name: null,
+      node_path: null,
+      attachment_refs: [],
+      parent_block_id: null,
+      children_block_ids: [],
+    })),
+  };
+}
 
 describe("normalizeLlmStructuredFields", () => {
   it("wraps single field items for schema array fields", () => {
@@ -82,6 +164,299 @@ describe("normalizeLlmStructuredFields", () => {
   it("tracks the schema fields expected to be arrays", () => {
     expect(ARRAY_STRUCTURED_FIELD_KEYS).toContain("deliverables");
     expect(ARRAY_STRUCTURED_FIELD_KEYS).not.toContain("business_scenario");
+  });
+});
+
+describe("runStructuringWithLlmOrFallback", () => {
+  it("uses a 60 second default timeout for structuring LLM calls", async () => {
+    process.env.EBS_LLM_STRUCTURING = "1";
+    const ir = sampleIr();
+
+    const result = await runStructuringWithLlmOrFallback(ir);
+
+    expect(result.structuring_mode).toBe("rules_fallback");
+    expect(chatCompletionText).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        label: "structuring.knowledge_skeleton",
+        timeoutMs: 60000,
+      }),
+    );
+    expect(chatCompletionText).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        label: "structuring.draft",
+        timeoutMs: 60000,
+      }),
+    );
+  });
+
+  it("uses a dedicated short timeout for structuring LLM calls before fallback", async () => {
+    process.env.EBS_LLM_STRUCTURING = "1";
+    process.env.EBS_LLM_STRUCTURING_TIMEOUT_MS = "12345";
+    process.env.DASHSCOPE_API_KEY = "dashscope-key";
+    process.env.DASHSCOPE_MODEL = "qwen-plus";
+    const ir = sampleIr();
+
+    const result = await runStructuringWithLlmOrFallback(ir);
+
+    expect(result.structuring_mode).toBe("rules_fallback");
+    expect(chatCompletionText).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        label: "structuring.knowledge_skeleton",
+        timeoutMs: 12345,
+        promptDiagnostics: expect.objectContaining({
+          stage: "knowledge_skeleton",
+          selectedBlockCount: 1,
+          totalBlockCount: 1,
+        }),
+      }),
+    );
+    expect(chatCompletionText).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        label: "structuring.knowledge_skeleton.fallback_dashscope",
+        provider: "dashscope",
+        timeoutMs: 12345,
+      }),
+    );
+    expect(chatCompletionText).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({
+        label: "structuring.draft",
+        timeoutMs: 12345,
+        promptDiagnostics: expect.objectContaining({
+          stage: "draft",
+          selectedBlockCount: 1,
+          totalBlockCount: 1,
+        }),
+      }),
+    );
+    expect(chatCompletionText).toHaveBeenNthCalledWith(
+      4,
+      expect.objectContaining({
+        label: "structuring.draft.fallback_dashscope",
+        provider: "dashscope",
+        timeoutMs: 12345,
+      }),
+    );
+  });
+
+  it("uses DashScope fallback after DeepSeek timeout and keeps LLM mode on success", async () => {
+    process.env.EBS_LLM_STRUCTURING = "1";
+    process.env.EBS_LLM_STRUCTURING_TIMEOUT_MS = "12345";
+    process.env.DASHSCOPE_API_KEY = "dashscope-key";
+    process.env.DASHSCOPE_MODEL = "qwen-plus";
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText
+      .mockRejectedValueOnce(new Error("TimeoutError: primary skeleton timed out"))
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          lifecycle_stages: ["输入", "处理", "输出"],
+          source_block_ids: ["b1"],
+        }),
+      )
+      .mockRejectedValueOnce(new Error("TimeoutError: primary draft timed out"))
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          business_scenario: {
+            content: { summary: "普通业务流程结构化" },
+            status: "Drafted",
+            confidence: 0.8,
+            source_refs: [{ block_id: "b1", source_file: "doc.md" }],
+          },
+          scenario_goal: {
+            content: { summary: "明确目标、输入、输出和执行动作" },
+            status: "Drafted",
+            confidence: 0.8,
+            source_refs: [{ block_id: "b1", source_file: "doc.md" }],
+          },
+          deliverables: [
+            {
+              content: { summary: "结构化流程草稿" },
+              status: "Drafted",
+              confidence: 0.8,
+              source_refs: [{ block_id: "b1", source_file: "doc.md" }],
+            },
+          ],
+        }),
+      );
+
+    const result = await runStructuringWithLlmOrFallback(sampleIr());
+
+    expect(result.structuring_mode).toBe("llm");
+    expect(mockedChatCompletionText).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        provider: "dashscope",
+        label: "structuring.knowledge_skeleton.fallback_dashscope",
+      }),
+    );
+    expect(mockedChatCompletionText).toHaveBeenNthCalledWith(
+      4,
+      expect.objectContaining({
+        provider: "dashscope",
+        label: "structuring.draft.fallback_dashscope",
+      }),
+    );
+  });
+});
+
+describe("runGlobalQualityTriageWithLlmOrFallback", () => {
+  it("runs a single lightweight LLM triage call on success", async () => {
+    process.env.EBS_LLM_STRUCTURING = "1";
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText.mockResolvedValueOnce(
+      JSON.stringify({
+        summary: "文档缺少判断标准和验证方式。",
+        major_gaps: [
+          {
+            field_key: "judgment_criteria",
+            severity: "high",
+            message: "判断标准不清晰。",
+            source_refs: [{ block_id: "b1" }],
+          },
+        ],
+        recommended_tasks: [
+          {
+            title: "补充判断标准",
+            reason: "当前只有执行动作。",
+            question: "这个动作的异常判断标准是什么？",
+            target_field: "judgment_criteria",
+            source_block_ids: ["b1"],
+            priority: "high",
+          },
+        ],
+        suggested_questions: [],
+        source_refs: [{ block_id: "b1" }],
+      }),
+    );
+
+    const result = await runGlobalQualityTriageWithLlmOrFallback(sampleLargeIr());
+
+    expect(result.triage_mode).toBe("llm");
+    expect(result.triage.recommended_tasks[0]?.title).toBe("补充判断标准");
+    expect(result.diagnostics.attempts[0]).toEqual(
+      expect.objectContaining({
+        stage: "global_triage",
+        label: "structuring.global_triage",
+        status: "ok",
+        user_prompt_chars: expect.any(Number),
+      }),
+    );
+    expect(mockedChatCompletionText).toHaveBeenCalledTimes(1);
+    expect(mockedChatCompletionText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        label: "structuring.global_triage",
+        promptDiagnostics: expect.objectContaining({
+          stage: "global_triage",
+          selectedBlockCount: expect.any(Number),
+        }),
+      }),
+    );
+  });
+
+  it("returns local heuristic triage after one failed LLM call", async () => {
+    process.env.EBS_LLM_STRUCTURING = "1";
+
+    const result = await runGlobalQualityTriageWithLlmOrFallback(sampleIr());
+
+    expect(result.triage_mode).toBe("rules_fallback");
+    expect(result.triage.summary).toContain("规则诊断");
+    expect(result.triage.recommended_tasks.length).toBeGreaterThan(0);
+    expect(result.diagnostics.attempts[0]).toEqual(
+      expect.objectContaining({
+        stage: "global_triage",
+        label: "structuring.global_triage",
+        status: "failed",
+        user_prompt_chars: expect.any(Number),
+      }),
+    );
+    expect(chatCompletionText).toHaveBeenCalledTimes(1);
+    expect(chatCompletionText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        label: "structuring.global_triage",
+      }),
+    );
+  });
+
+  it("normalizes common DeepSeek triage shapes before schema validation", async () => {
+    process.env.EBS_LLM_STRUCTURING = "1";
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText.mockResolvedValueOnce(
+      JSON.stringify({
+        summary: "文档缺少恢复步骤和负责人。",
+        major_gaps: [
+          {
+            field_key: "steps",
+            severity: "critical",
+            message: "步骤太少。",
+            source_refs: ["b1"],
+          },
+        ],
+        recommended_tasks: [
+          {
+            title: "补充恢复步骤",
+            reason: "当前只有一句动作。",
+            question: "具体恢复步骤是什么？",
+            target_field: "steps",
+            source_block_ids: ["b1"],
+            priority: "urgent",
+          },
+        ],
+        suggested_questions: [],
+        source_refs: ["b1"],
+      }),
+    );
+
+    const result = await runGlobalQualityTriageWithLlmOrFallback(sampleIr());
+
+    expect(result.triage_mode).toBe("llm");
+    expect(result.triage.major_gaps[0]?.severity).toBe("high");
+    expect(result.triage.major_gaps[0]?.source_refs[0]?.block_id).toBe("b1");
+    expect(result.triage.recommended_tasks[0]?.priority).toBe("high");
+    expect(result.triage.source_refs[0]?.block_id).toBe("b1");
+  });
+});
+
+describe("buildCompactDocumentContext", () => {
+  it("keeps a budgeted subset of blocks instead of the whole IR", () => {
+    const context = buildCompactDocumentContext(sampleLargeIr(), {
+      maxBlocks: 5,
+      maxBlockChars: 80,
+    });
+
+    expect(context.selectedBlockCount).toBeLessThan(context.totalBlockCount);
+    expect(context.selectedBlockCount).toBeLessThanOrEqual(5);
+    expect(context.text).toContain("b1");
+    expect(context.text).toContain("b6");
+    expect(context.text).not.toContain("b12");
+  });
+
+  it("trims long block text while keeping block_id provenance", () => {
+    const context = buildCompactDocumentContext(sampleLargeIr(), {
+      maxBlocks: 8,
+      maxBlockChars: 80,
+    });
+
+    expect(context.text).toContain("b7");
+    expect(context.text).toContain("判断标准");
+    expect(context.text).toContain("…");
+    expect(context.text.length).toBeLessThan(5000);
+  });
+});
+
+describe("buildGlobalQualityTriagePromptInput", () => {
+  it("builds a short global triage prompt instead of a full structuring prompt", () => {
+    const input = buildGlobalQualityTriagePromptInput(sampleLargeIr());
+
+    expect(input.context.selectedBlockCount).toBeLessThanOrEqual(4);
+    expect(input.prompt.length).toBeLessThan(1600);
+    expect(input.prompt).toContain("b1");
+    expect(input.prompt).toContain("recommended_tasks");
+    expect(input.prompt).not.toContain("BusinessDocStructuredDraft");
+    expect(input.prompt).not.toContain("GroundTruthDraft");
   });
 });
 

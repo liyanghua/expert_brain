@@ -14,6 +14,7 @@
     "test": "pnpm -r run test",
     "typecheck": "pnpm -r run typecheck",
     "validate-schemas": "pnpm exec tsx scripts/dev/validate-schemas.ts",
+    "probe:llm": "pnpm exec tsx scripts/dev/probe-llm-chain.ts",
     "test:e2e": "pnpm --filter @ebs/web exec playwright test",
     "eval": "pnpm exec tsx scripts/eval/run-extraction-eval.ts",
     "eval:docling-ab": "pnpm exec tsx scripts/eval/compare-docling-scorecard.ts"

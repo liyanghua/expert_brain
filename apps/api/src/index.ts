@@ -11,6 +11,7 @@ import {
   buildImprovementPlan,
   computeExtractionScorecard,
 } from "@ebs/extraction-scorecard";
+import type { ImprovementPlan } from "@ebs/extraction-scorecard";
 import {
   GTCandidateSchema,
   GroundTruthDraftSchema,
@@ -23,6 +24,7 @@ import {
 import type {
   DocumentStatus,
   GTCandidate,
+  GlobalQualityTriage,
   GroundTruthDraft,
   GroundTruthFieldItem,
   SourceRef,
@@ -151,6 +153,64 @@ function isoNow() {
 function bodyString(body: Record<string, unknown>, key: string): string | null {
   const value = body[key];
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function mergeGlobalTriageIntoImprovementPlan(
+  plan: ImprovementPlan,
+  triage: GlobalQualityTriage,
+): ImprovementPlan {
+  const candidateQuestions = [...plan.candidate_questions];
+  const seenQuestions = new Set(candidateQuestions.map((q) => q.question));
+  const addQuestion = (input: {
+    question: string;
+    target_field?: string;
+    source_block_ids?: string[];
+  }) => {
+    if (seenQuestions.has(input.question)) return;
+    seenQuestions.add(input.question);
+    candidateQuestions.push({
+      metric: "global_quality_triage",
+      metric_label: "全局质量诊断",
+      question: input.question,
+      target_field: input.target_field,
+      source_block_id: input.source_block_ids?.[0],
+    });
+  };
+
+  for (const task of triage.recommended_tasks) {
+    addQuestion({
+      question: task.question,
+      target_field: task.target_field,
+      source_block_ids: task.source_block_ids,
+    });
+  }
+  for (const question of triage.suggested_questions) {
+    addQuestion({
+      question: question.question,
+      target_field: question.target_field,
+      source_block_ids: question.source_block_ids,
+    });
+  }
+
+  const priority_actions =
+    triage.recommended_tasks.length > 0
+      ? [
+          {
+            metric: "global_quality_triage",
+            metric_display_name: "全局质量诊断",
+            reason: triage.summary,
+            actions: triage.recommended_tasks.map((task) => task.question),
+            actions_display: triage.recommended_tasks.map((task) => task.title),
+          },
+          ...plan.priority_actions,
+        ]
+      : plan.priority_actions;
+
+  return {
+    ...plan,
+    priority_actions,
+    candidate_questions: candidateQuestions,
+  };
 }
 
 function threadTitleForField(fieldKey: string | null, fallback: string) {
@@ -371,33 +431,77 @@ app.post("/documents/:docId/jobs/process-next", async (c) => {
 
 app.post("/documents/:docId/extract", async (c) => {
   const docId = c.req.param("docId");
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const requestedMode =
+    c.req.query("mode") ??
+    bodyString(body, "mode") ??
+    bodyString(body, "structuring_mode");
   const meta = store.readMeta(docId);
   const versionId = meta.current_version_id;
   const ir = tryReadIR(docId, versionId);
   if (!ir) {
     return c.json(irNotReadyPayload(docId, versionId), 409);
   }
-  const { draft, structuring_mode, diagnostics } =
-    await orchestrator.runA1StructuringAsync(ir);
+  if (requestedMode === "deep" || requestedMode === "llm") {
+    const { draft, structuring_mode, diagnostics } =
+      await orchestrator.runA1StructuringAsync(ir);
+    store.writeDraft(docId, versionId, draft);
+    meta.document_status = "Extracted";
+    meta.audit.push({
+      at: new Date().toISOString(),
+      action: "structuring_run",
+      detail: JSON.stringify({
+        structuring_mode,
+        llm_failure_reason: diagnostics.llm_failure_reason,
+        quality_issues: diagnostics.quality_issues,
+      }),
+    });
+    store.writeMeta(meta);
+    const scorecard = computeExtractionScorecard({ draft, ir });
+    const improvement_plan = buildImprovementPlan(scorecard, draft, ir);
+    return c.json({
+      draft,
+      scorecard,
+      improvement_plan,
+      structuring_mode,
+      quality_triage_mode: "deep_structuring",
+      parse_diagnostics: buildParseDiagnostics(ir),
+      structuring_diagnostics: diagnostics,
+    });
+  }
+
+  const draft = orchestrator.runA1Structuring(ir);
+  const {
+    triage: global_quality_triage,
+    triage_mode: quality_triage_mode,
+    diagnostics,
+  } = await orchestrator.runA1GlobalQualityTriageAsync(ir);
+  const structuring_mode = "rules";
   store.writeDraft(docId, versionId, draft);
   meta.document_status = "Extracted";
   meta.audit.push({
     at: new Date().toISOString(),
-    action: "structuring_run",
+    action: "quality_triage_run",
     detail: JSON.stringify({
       structuring_mode,
+      quality_triage_mode,
       llm_failure_reason: diagnostics.llm_failure_reason,
-      quality_issues: diagnostics.quality_issues,
+      global_quality_summary: global_quality_triage.summary,
     }),
   });
   store.writeMeta(meta);
   const scorecard = computeExtractionScorecard({ draft, ir });
-  const improvement_plan = buildImprovementPlan(scorecard, draft, ir);
+  const improvement_plan = mergeGlobalTriageIntoImprovementPlan(
+    buildImprovementPlan(scorecard, draft, ir),
+    global_quality_triage,
+  );
   return c.json({
     draft,
     scorecard,
     improvement_plan,
     structuring_mode,
+    quality_triage_mode,
+    global_quality_triage,
     parse_diagnostics: buildParseDiagnostics(ir),
     structuring_diagnostics: diagnostics,
   });
@@ -416,7 +520,9 @@ app.get("/documents/:docId/diagnostics", async (c) => {
         },
     latest_structuring_audit: [...meta.audit]
       .reverse()
-      .find((a) => a.action === "structuring_run"),
+      .find(
+        (a) => a.action === "structuring_run" || a.action === "quality_triage_run",
+      ),
   });
 });
 

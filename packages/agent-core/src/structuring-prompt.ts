@@ -2,9 +2,56 @@ import type { DocumentIR } from "@ebs/document-ir";
 import { STRUCTURED_FIELD_KEYS } from "@ebs/ground-truth-schema";
 
 const MAX_BLOCK_CHARS = 4000;
+const DEFAULT_MAX_COMPACT_BLOCKS = 80;
+const DEFAULT_MAX_COMPACT_BLOCK_CHARS = 900;
+const DEFAULT_MAX_COMPACT_TABLE_CHARS = 1800;
+const IMPORTANT_BLOCK_PATTERN =
+  /商品诊断|生命周期|商品等级|诊断维度|判断标准|核心指标|执行动作|任务清单|排查|定位问题|解决方法|触发|终止|输入|输出|目标|场景|交付|流程|模型|常见问题|FAQ|验证|工具|模板|例外|不适用|指标|阈值|转化率|加购率|退款率|ROI|GMV/i;
+
+export type CompactDocumentContext = {
+  text: string;
+  totalBlockCount: number;
+  selectedBlockCount: number;
+  selectedBlockIds: string[];
+  contextChars: number;
+};
+
+export type CompactDocumentContextOptions = {
+  maxBlocks?: number;
+  maxBlockChars?: number;
+  maxTableChars?: number;
+  paragraphsPerHeading?: number;
+  maxOutlineItems?: number;
+  maxOutlineChars?: number;
+};
 
 function compactBlockText(text: string, max = MAX_BLOCK_CHARS): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+function positiveInt(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function compactBudget(opts?: CompactDocumentContextOptions) {
+  return {
+    maxBlocks: opts?.maxBlocks ?? positiveInt(
+      process.env.EBS_STRUCTURING_MAX_BLOCKS,
+      DEFAULT_MAX_COMPACT_BLOCKS,
+    ),
+    maxBlockChars: opts?.maxBlockChars ?? positiveInt(
+      process.env.EBS_STRUCTURING_MAX_BLOCK_CHARS,
+      DEFAULT_MAX_COMPACT_BLOCK_CHARS,
+    ),
+    maxTableChars: opts?.maxTableChars ?? positiveInt(
+      process.env.EBS_STRUCTURING_MAX_TABLE_CHARS,
+      DEFAULT_MAX_COMPACT_TABLE_CHARS,
+    ),
+    paragraphsPerHeading: opts?.paragraphsPerHeading ?? 2,
+    maxOutlineItems: opts?.maxOutlineItems ?? 48,
+    maxOutlineChars: opts?.maxOutlineChars ?? 120,
+  };
 }
 
 function tableFieldHints(): string {
@@ -73,11 +120,14 @@ For ecommerce/product-diagnosis documents, include lifecycle_stages, product_gra
 }
 
 export function buildKnowledgeSkeletonUserPrompt(ir: DocumentIR): string {
+  const context = buildCompactDocumentContext(ir, {
+    maxBlocks: Math.min(positiveInt(process.env.EBS_STRUCTURING_MAX_BLOCKS, 80), 60),
+  });
   return `doc_id: ${ir.doc_id}
 version_id: ${ir.version_id}
 
 Document context:
-${buildDocumentContext(ir)}`;
+${context.text}`;
 }
 
 export function buildDocumentContext(ir: DocumentIR): string {
@@ -121,25 +171,190 @@ All blocks:
 ${JSON.stringify(blocks, null, 2)}`;
 }
 
-export function buildStructuringUserPrompt(
+export function buildCompactDocumentContext(
+  ir: DocumentIR,
+  opts?: CompactDocumentContextOptions,
+): CompactDocumentContext {
+  const budget = compactBudget(opts);
+  const selected = new Set<string>();
+  const headingIndexes: number[] = [];
+
+  ir.blocks.forEach((block, index) => {
+    if (block.block_type === "heading" || block.block_type === "outline") {
+      selected.add(block.block_id);
+      if ((block.heading_level ?? 0) <= 2) headingIndexes.push(index);
+    }
+    if (block.block_type === "table") selected.add(block.block_id);
+    if (IMPORTANT_BLOCK_PATTERN.test(block.text_content)) {
+      selected.add(block.block_id);
+    }
+  });
+
+  for (const headingIndex of headingIndexes) {
+    let addedAfterHeading = 0;
+    for (
+      let i = headingIndex + 1;
+      i < ir.blocks.length && addedAfterHeading < budget.paragraphsPerHeading;
+      i += 1
+    ) {
+      const block = ir.blocks[i]!;
+      if (block.block_type === "heading" && (block.heading_level ?? 0) <= 2) break;
+      if (block.block_type === "paragraph" || block.block_type === "list") {
+        selected.add(block.block_id);
+        addedAfterHeading += 1;
+      }
+    }
+  }
+
+  const selectedBlocks = ir.blocks
+    .filter((block) => selected.has(block.block_id))
+    .slice(0, budget.maxBlocks);
+  const outline = ir.blocks
+    .filter((block) => block.block_type === "heading" || block.block_type === "outline")
+    .slice(0, budget.maxOutlineItems)
+    .map((block) => ({
+      block_id: block.block_id,
+      text: compactBlockText(block.text_content, budget.maxOutlineChars),
+      level: block.heading_level,
+    }));
+  const blocks = selectedBlocks.map((block) => ({
+    block_id: block.block_id,
+    block_type: block.block_type,
+    text_content: compactBlockText(
+      block.text_content,
+      block.block_type === "table" ? budget.maxTableChars : budget.maxBlockChars,
+    ),
+    source_span: block.source_span,
+  }));
+  const text = `Context stats:
+${JSON.stringify(
+  {
+    total_blocks: ir.blocks.length,
+    selected_blocks: selectedBlocks.length,
+    max_blocks: budget.maxBlocks,
+  },
+  null,
+  2,
+)}
+
+Compressed outline:
+${JSON.stringify(outline, null, 2)}
+
+Selected key blocks:
+${JSON.stringify(blocks, null, 2)}`;
+
+  return {
+    text,
+    totalBlockCount: ir.blocks.length,
+    selectedBlockCount: selectedBlocks.length,
+    selectedBlockIds: selectedBlocks.map((block) => block.block_id),
+    contextChars: text.length,
+  };
+}
+
+export function buildKnowledgeSkeletonPromptInput(ir: DocumentIR): {
+  prompt: string;
+  context: CompactDocumentContext;
+} {
+  const context = buildCompactDocumentContext(ir, {
+    maxBlocks: Math.min(positiveInt(process.env.EBS_STRUCTURING_MAX_BLOCKS, 80), 14),
+    maxBlockChars: Math.min(
+      positiveInt(process.env.EBS_STRUCTURING_MAX_BLOCK_CHARS, 900),
+      320,
+    ),
+    maxTableChars: Math.min(
+      positiveInt(process.env.EBS_STRUCTURING_MAX_TABLE_CHARS, 1800),
+      700,
+    ),
+    paragraphsPerHeading: 1,
+    maxOutlineItems: 20,
+    maxOutlineChars: 80,
+  });
+  return {
+    prompt: `doc_id: ${ir.doc_id}
+version_id: ${ir.version_id}
+
+Document context:
+${context.text}`,
+    context,
+  };
+}
+
+export function buildGlobalQualityTriageSystemPrompt(): string {
+  return `Return JSON only. Lightweight quality triage. Use severity/priority only: low, medium, high. source_refs must be objects with block_id. Keep every text field short.`;
+}
+
+export function buildGlobalQualityTriagePromptInput(ir: DocumentIR): {
+  prompt: string;
+  context: CompactDocumentContext;
+} {
+  const context = buildCompactDocumentContext(ir, {
+    maxBlocks: Math.min(positiveInt(process.env.EBS_TRIAGE_MAX_BLOCKS, 4), 4),
+    maxBlockChars: 100,
+    maxTableChars: 180,
+    paragraphsPerHeading: 1,
+    maxOutlineItems: 4,
+    maxOutlineChars: 32,
+  });
+  return {
+    prompt: `doc_id: ${ir.doc_id}
+version_id: ${ir.version_id}
+
+Goal: find top 2 quality gaps and local expert questions. Do not map all fields. Return at most 2 major_gaps, 2 recommended_tasks, 2 suggested_questions. Keep each message/reason/question concise.
+JSON keys: summary, major_gaps[{field_key,severity,message,source_refs[{block_id}]}], recommended_tasks[{title,reason,question,target_field,source_block_ids,priority}], suggested_questions[{question,target_field,source_block_ids}], source_refs[{block_id}].
+
+Compact document context:
+${context.text}`,
+    context,
+  };
+}
+
+export function buildStructuringPromptInput(
   ir: DocumentIR,
   knowledgeSkeleton?: unknown,
-): string {
+): {
+  prompt: string;
+  context: CompactDocumentContext;
+} {
   const skeleton =
     knowledgeSkeleton === undefined
       ? "(not available)"
       : typeof knowledgeSkeleton === "string"
         ? knowledgeSkeleton
         : JSON.stringify(knowledgeSkeleton, null, 2);
-  return `doc_id: ${ir.doc_id}
+  const context = buildCompactDocumentContext(ir, {
+    maxBlocks: Math.min(positiveInt(process.env.EBS_STRUCTURING_MAX_BLOCKS, 80), 24),
+    maxBlockChars: Math.min(
+      positiveInt(process.env.EBS_STRUCTURING_MAX_BLOCK_CHARS, 900),
+      500,
+    ),
+    maxTableChars: Math.min(
+      positiveInt(process.env.EBS_STRUCTURING_MAX_TABLE_CHARS, 1800),
+      1000,
+    ),
+    paragraphsPerHeading: 1,
+    maxOutlineItems: 28,
+    maxOutlineChars: 100,
+  });
+  return {
+    prompt: `doc_id: ${ir.doc_id}
 version_id: ${ir.version_id}
 
 Phase A knowledge skeleton:
 ${skeleton}
 
 Phase B task:
-Map the skeleton and source blocks into BusinessDocStructuredDraft JSON. Use exact block_id values in source_refs.
+Map the skeleton and selected source blocks into BusinessDocStructuredDraft JSON. Use exact block_id values in source_refs. If a needed detail is absent from selected blocks, record it in gaps_structured rather than inventing it.
 
-Document IR context:
-${buildDocumentContext(ir)}`;
+Document IR compact context:
+${context.text}`,
+    context,
+  };
+}
+
+export function buildStructuringUserPrompt(
+  ir: DocumentIR,
+  knowledgeSkeleton?: unknown,
+): string {
+  return buildStructuringPromptInput(ir, knowledgeSkeleton).prompt;
 }

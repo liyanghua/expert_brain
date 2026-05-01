@@ -8,6 +8,7 @@ import {
   QAResponseSchema,
   type ExpertMemory,
   FIELD_DEFINITIONS_ZH,
+  type LlmCallDiagnostics,
   type PublishReadinessResponse,
   type QAResponse,
   type QuestionRefinementResponse,
@@ -16,7 +17,7 @@ import {
   type StructuredFieldKey,
   type SourceRef,
 } from "@ebs/ground-truth-schema";
-import { chatCompletionText } from "./llm-client.js";
+import { chatCompletionText, resolveLlmRequestConfig } from "./llm-client.js";
 
 function blockRefs(blocks: DocumentBlock[]): SourceRef[] {
   return blocks.map((b) => ({
@@ -254,6 +255,23 @@ function evidenceBlocksForInput(input: {
     .filter((block): block is DocumentIR["blocks"][number] => Boolean(block));
 }
 
+function compactEvidenceBlocks(blocks: DocumentBlock[], opts?: {
+  maxBlocks?: number;
+  maxChars?: number;
+}) {
+  const maxBlocks = opts?.maxBlocks ?? 6;
+  const maxChars = opts?.maxChars ?? 800;
+  return blocks.slice(0, maxBlocks).map((block) => ({
+    block_id: block.block_id,
+    block_type: block.block_type,
+    text_content:
+      block.text_content.length > maxChars
+        ? `${block.text_content.slice(0, maxChars)}…`
+        : block.text_content,
+    source_span: block.source_span,
+  }));
+}
+
 function buildFallbackQuestionRefinement(input: {
   ir: DocumentIR;
   blockId: string | null;
@@ -280,6 +298,49 @@ function buildFallbackQuestionRefinement(input: {
     context_summary: contextSummary || "暂无已选证据 block。",
     source_block_refs: evidenceBlocks.map((block) => block.block_id),
     rationale: `根据目标字段“${fieldLabel}”和缺口原因“${gap}”生成，供专家确认后再提交给 QA Agent。`,
+  };
+}
+
+function classifyAgentLlmError(err: unknown): {
+  reason: string;
+  message: string;
+} {
+  const message = err instanceof Error ? err.message : String(err);
+  if (/Timeout|aborted|AbortError/i.test(message)) {
+    return { reason: "timeout", message };
+  }
+  if (/LLM HTTP/i.test(message)) {
+    return { reason: "http_error", message };
+  }
+  return { reason: "unknown_error", message };
+}
+
+function buildLlmCallDiagnostics(input: {
+  label: string;
+  system: string;
+  user: string;
+  timeoutMs?: number;
+  status?: "ok" | "failed" | "skipped";
+  startedAt?: number;
+  reason?: string;
+  message?: string;
+}): LlmCallDiagnostics {
+  const config = resolveLlmRequestConfig({
+    label: input.label,
+    timeoutMs: input.timeoutMs,
+  });
+  return {
+    label: input.label,
+    provider: config.provider,
+    model: config.model,
+    timeout_ms: config.timeoutMs,
+    system_prompt_chars: input.system.length,
+    user_prompt_chars: input.user.length,
+    elapsed_ms:
+      input.startedAt == null ? undefined : Date.now() - input.startedAt,
+    status: input.status ?? "ok",
+    reason: input.reason,
+    message: input.message,
   };
 }
 
@@ -316,26 +377,65 @@ export async function runQuestionRefinementAsync(input: {
       target_field: input.targetField,
       gap_reason: input.gapReason,
       low_score_metric: input.metric,
-      evidence_blocks: evidenceBlocks.map((block) => ({
-        block_id: block.block_id,
-        block_type: block.block_type,
-        text_content: block.text_content,
-        source_span: block.source_span,
-      })),
+      evidence_blocks: compactEvidenceBlocks(evidenceBlocks),
       related_structured_items: related,
     },
     null,
     2,
   );
   try {
-    const timeoutMs = Number(process.env.EBS_LLM_QA_TIMEOUT_MS ?? 30_000);
-    const raw = await chatCompletionText({ system, user, timeoutMs });
+    const label = "qa.refine_question";
+    const config = resolveLlmRequestConfig({ label });
+    const startedAt = Date.now();
+    const raw = await chatCompletionText({
+      system,
+      user,
+      timeoutMs: config.timeoutMs,
+      label,
+    });
     const parsed = JSON.parse(raw.trim()) as unknown;
     const checked = QuestionRefinementResponseSchema.safeParse(parsed);
-    if (checked.success) return checked.data;
-    return fallback();
-  } catch {
-    return fallback();
+    if (checked.success) {
+      return {
+        ...checked.data,
+        llm_diagnostics: buildLlmCallDiagnostics({
+          label,
+          system,
+          user,
+          timeoutMs: config.timeoutMs,
+          startedAt,
+        }),
+      };
+    }
+    return {
+      ...fallback(),
+      llm_diagnostics: buildLlmCallDiagnostics({
+        label,
+        system,
+        user,
+        timeoutMs: config.timeoutMs,
+        startedAt,
+        status: "failed",
+        reason: "schema_validation_error",
+        message: "LLM response did not match QuestionRefinementResponseSchema",
+      }),
+    };
+  } catch (err) {
+    const label = "qa.refine_question";
+    const config = resolveLlmRequestConfig({ label });
+    const { reason, message } = classifyAgentLlmError(err);
+    return {
+      ...fallback(),
+      llm_diagnostics: buildLlmCallDiagnostics({
+        label,
+        system,
+        user,
+        timeoutMs: config.timeoutMs,
+        status: "failed",
+        reason,
+        message,
+      }),
+    };
   }
 }
 
@@ -410,31 +510,65 @@ export async function runDocQAAsync(input: {
       target_field: input.targetField,
       gap_reason: input.gapReason,
       low_score_metric: input.metric,
-      evidence_blocks: evidenceBlocks.map((block) => ({
-        block_id: block.block_id,
-        block_type: block.block_type,
-        text_content: block.text_content,
-        source_span: block.source_span,
-      })),
+      evidence_blocks: compactEvidenceBlocks(evidenceBlocks),
       related_structured_items: related,
-      document_context: input.ir.blocks.slice(0, 40).map((b) => ({
-        block_id: b.block_id,
-        block_type: b.block_type,
-        text_content: b.text_content.slice(0, 1200),
-      })),
     },
     null,
     2,
   );
   try {
-    const timeoutMs = Number(process.env.EBS_LLM_QA_TIMEOUT_MS ?? 30_000);
-    const raw = await chatCompletionText({ system, user, timeoutMs });
+    const label = "qa.answer";
+    const config = resolveLlmRequestConfig({ label });
+    const startedAt = Date.now();
+    const raw = await chatCompletionText({
+      system,
+      user,
+      timeoutMs: config.timeoutMs,
+      label,
+    });
     const parsed = JSON.parse(raw.trim()) as unknown;
     const checked = QAResponseSchema.safeParse(parsed);
-    if (checked.success) return checked.data;
-    return fallback();
-  } catch {
-    return fallback();
+    if (checked.success) {
+      return {
+        ...checked.data,
+        llm_diagnostics: buildLlmCallDiagnostics({
+          label,
+          system,
+          user,
+          timeoutMs: config.timeoutMs,
+          startedAt,
+        }),
+      };
+    }
+    return {
+      ...fallback(),
+      llm_diagnostics: buildLlmCallDiagnostics({
+        label,
+        system,
+        user,
+        timeoutMs: config.timeoutMs,
+        startedAt,
+        status: "failed",
+        reason: "schema_validation_error",
+        message: "LLM response did not match QAResponseSchema",
+      }),
+    };
+  } catch (err) {
+    const label = "qa.answer";
+    const config = resolveLlmRequestConfig({ label });
+    const { reason, message } = classifyAgentLlmError(err);
+    return {
+      ...fallback(),
+      llm_diagnostics: buildLlmCallDiagnostics({
+        label,
+        system,
+        user,
+        timeoutMs: config.timeoutMs,
+        status: "failed",
+        reason,
+        message,
+      }),
+    };
   }
 }
 

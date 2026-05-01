@@ -1,21 +1,26 @@
 import type { DocumentIR } from "@ebs/document-ir";
 import {
   GroundTruthDraftSchema,
+  GlobalQualityTriageSchema,
   STRUCTURED_FIELD_KEYS,
   emptyGroundTruthDraft,
+  type GlobalQualityTriage,
   type GroundTruthDraft,
   type StructuredFieldKey,
 } from "@ebs/ground-truth-schema";
 import { runStructuring } from "./agents.js";
-import { chatCompletionText } from "./llm-client.js";
+import { chatCompletionText, resolveLlmRequestConfig } from "./llm-client.js";
 import {
+  buildGlobalQualityTriagePromptInput,
+  buildGlobalQualityTriageSystemPrompt,
   buildKnowledgeSkeletonSystemPrompt,
-  buildKnowledgeSkeletonUserPrompt,
+  buildKnowledgeSkeletonPromptInput,
   buildStructuringSystemPrompt,
-  buildStructuringUserPrompt,
+  buildStructuringPromptInput,
 } from "./structuring-prompt.js";
 
 export type StructuringMode = "llm" | "rules" | "rules_fallback";
+export type GlobalQualityTriageMode = "llm" | "rules" | "rules_fallback";
 export type StructuringFailureReason =
   | "disabled"
   | "http_error"
@@ -27,10 +32,22 @@ export type StructuringFailureReason =
 
 export type StructuringDiagnostics = {
   attempts: {
-    stage: "knowledge_skeleton" | "draft" | "strict_retry" | "rules";
+    stage:
+      | "global_triage"
+      | "knowledge_skeleton"
+      | "draft"
+      | "strict_retry"
+      | "rules";
     status: "ok" | "failed" | "skipped";
     reason?: StructuringFailureReason;
     message?: string;
+    label?: string;
+    provider?: string;
+    model?: string;
+    timeout_ms?: number;
+    system_prompt_chars?: number;
+    user_prompt_chars?: number;
+    elapsed_ms?: number;
   }[];
   llm_failure_reason?: StructuringFailureReason;
   llm_failure_message?: string;
@@ -41,6 +58,39 @@ export type StructuringDiagnostics = {
 export function isLlmStructuringEnabled(): boolean {
   const v = process.env.EBS_LLM_STRUCTURING?.trim().toLowerCase();
   return v === "1" || v === "true" || v === "yes";
+}
+
+function structuringTimeoutMs(): number {
+  const parsed = Number(process.env.EBS_LLM_STRUCTURING_TIMEOUT_MS ?? 60_000);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 60_000;
+}
+
+function triageTimeoutMs(): number {
+  const parsed = Number(process.env.EBS_LLM_TRIAGE_TIMEOUT_MS ?? 30_000);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30_000;
+}
+
+function hasDashScopeFallbackConfig(): boolean {
+  return Boolean(process.env.DASHSCOPE_API_KEY && process.env.DASHSCOPE_MODEL);
+}
+
+function promptDiagnostics(
+  stage: "global_triage" | "knowledge_skeleton" | "draft" | "strict_retry",
+  context: {
+    totalBlockCount: number;
+    selectedBlockCount: number;
+    selectedBlockIds: string[];
+    contextChars: number;
+  },
+): Record<string, unknown> {
+  return {
+    stage,
+    totalBlockCount: context.totalBlockCount,
+    selectedBlockCount: context.selectedBlockCount,
+    contextChars: context.contextChars,
+    selectedBlockIdsPreview: context.selectedBlockIds.slice(0, 12),
+    omittedSelectedBlockIds: Math.max(0, context.selectedBlockIds.length - 12),
+  };
 }
 
 export const ARRAY_STRUCTURED_FIELD_KEYS = [
@@ -103,6 +153,83 @@ function extractJsonObject(raw: string): unknown {
   const fence = /^```(?:json)?\s*([\s\S]*?)```/im.exec(t);
   const body = fence ? fence[1]!.trim() : t;
   return JSON.parse(body) as unknown;
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function normalizeTriageSeverity(value: unknown): "low" | "medium" | "high" {
+  const normalized = typeof value === "string" ? value.toLowerCase() : "";
+  if (normalized === "low" || normalized === "medium" || normalized === "high") {
+    return normalized;
+  }
+  if (normalized === "critical" || normalized === "urgent" || normalized === "severe") {
+    return "high";
+  }
+  return "medium";
+}
+
+function normalizeTriageSourceRefs(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (typeof item === "string" && item.trim()) {
+        return { block_id: item.trim() };
+      }
+      const record = asRecord(item);
+      return typeof record.block_id === "string" && record.block_id.trim()
+        ? record
+        : null;
+    })
+    .filter((item): item is Record<string, unknown> => item != null);
+}
+
+function normalizeGlobalQualityTriagePayload(value: unknown): unknown {
+  const input = asRecord(value);
+  return {
+    ...input,
+    major_gaps: Array.isArray(input.major_gaps)
+      ? input.major_gaps.map((gap) => {
+          const record = asRecord(gap);
+          return {
+            ...record,
+            severity: normalizeTriageSeverity(record.severity),
+            source_refs: normalizeTriageSourceRefs(record.source_refs),
+          };
+        })
+      : [],
+    recommended_tasks: Array.isArray(input.recommended_tasks)
+      ? input.recommended_tasks.map((task) => {
+          const record = asRecord(task);
+          return {
+            ...record,
+            priority: normalizeTriageSeverity(record.priority),
+            source_block_ids: Array.isArray(record.source_block_ids)
+              ? record.source_block_ids.filter(
+                  (blockId): blockId is string => typeof blockId === "string",
+                )
+              : [],
+          };
+        })
+      : [],
+    suggested_questions: Array.isArray(input.suggested_questions)
+      ? input.suggested_questions.map((question) => {
+          const record = asRecord(question);
+          return {
+            ...record,
+            source_block_ids: Array.isArray(record.source_block_ids)
+              ? record.source_block_ids.filter(
+                  (blockId): blockId is string => typeof blockId === "string",
+                )
+              : [],
+          };
+        })
+      : [],
+    source_refs: normalizeTriageSourceRefs(input.source_refs),
+  };
 }
 
 function mergeDraftFromLlm(
@@ -225,6 +352,47 @@ function classifyLlmError(err: unknown): {
   return { reason: "unknown_error", message };
 }
 
+function isDashScopeRetryable(reason: StructuringFailureReason, message: string) {
+  return (
+    reason === "timeout" ||
+    reason === "http_error" ||
+    /fetch failed|ECONNRESET|socket hang up|network/i.test(message)
+  );
+}
+
+async function chatCompletionTextWithDashScopeFallback(opts: {
+  system: string;
+  user: string;
+  timeoutMs: number;
+  label: string;
+  promptDiagnostics?: Record<string, unknown>;
+}): Promise<string> {
+  try {
+    return await chatCompletionText(opts);
+  } catch (err) {
+    const { reason, message } = classifyLlmError(err);
+    if (!hasDashScopeFallbackConfig() || !isDashScopeRetryable(reason, message)) {
+      throw err;
+    }
+    const fallbackLabel = `${opts.label}.fallback_dashscope`;
+    console.info("[EBS LLM fallback]", {
+      from: opts.label,
+      to: fallbackLabel,
+      provider: "dashscope",
+      reason,
+      message,
+    });
+    return chatCompletionText({
+      system: opts.system,
+      user: opts.user,
+      timeoutMs: opts.timeoutMs,
+      label: fallbackLabel,
+      provider: "dashscope",
+      promptDiagnostics: opts.promptDiagnostics,
+    });
+  }
+}
+
 function fallbackResult(
   ir: DocumentIR,
   diagnostics: StructuringDiagnostics,
@@ -243,6 +411,189 @@ function fallbackResult(
     structuring_mode: "rules_fallback",
     diagnostics,
   };
+}
+
+function sourceBlockIdsForTriage(ir: DocumentIR): string[] {
+  return ir.blocks
+    .filter((block) =>
+      /判断|标准|验证|输出|交付|触发|终止|输入|目标|流程|执行|问题|解决/.test(
+        block.text_content,
+      ),
+    )
+    .slice(0, 4)
+    .map((block) => block.block_id);
+}
+
+function heuristicGlobalQualityTriage(ir: DocumentIR): GlobalQualityTriage {
+  const sourceBlockIds = sourceBlockIdsForTriage(ir);
+  const source_refs = sourceBlockIds.map((block_id) => ({ block_id }));
+  const sourceText = ir.blocks.map((block) => block.text_content).join("\n");
+  const major_gaps: GlobalQualityTriage["major_gaps"] = [];
+  const recommended_tasks: GlobalQualityTriage["recommended_tasks"] = [];
+
+  const addGapTask = (input: {
+    field_key: string;
+    title: string;
+    message: string;
+    question: string;
+    priority?: "low" | "medium" | "high";
+  }) => {
+    major_gaps.push({
+      field_key: input.field_key,
+      severity: input.priority ?? "medium",
+      message: input.message,
+      source_refs,
+    });
+    recommended_tasks.push({
+      title: input.title,
+      reason: input.message,
+      question: input.question,
+      target_field: input.field_key,
+      source_block_ids: sourceBlockIds,
+      priority: input.priority ?? "medium",
+    });
+  };
+
+  if (!/判断标准|标准|阈值|通过|异常|正常/.test(sourceText)) {
+    addGapTask({
+      field_key: "judgment_criteria",
+      title: "补充判断标准",
+      message: "当前文档缺少明确的判断口径或阈值。",
+      question: "这个流程里什么情况下判定为正常、异常或通过？",
+      priority: "high",
+    });
+  }
+  if (!/验证|验收|复核|效果|检查/.test(sourceText)) {
+    addGapTask({
+      field_key: "validation_methods",
+      title: "补充验证方法",
+      message: "当前文档缺少执行完成后的验证方式。",
+      question: "执行完成后，应该如何验证结果有效？",
+      priority: "medium",
+    });
+  }
+  if (!/输出|交付|产出|结论|报告/.test(sourceText)) {
+    addGapTask({
+      field_key: "deliverables",
+      title: "明确输出成果",
+      message: "当前文档没有清楚说明流程结束后应产出什么。",
+      question: "完成这个流程后，需要交付哪些结论、动作或材料？",
+      priority: "medium",
+    });
+  }
+  if (recommended_tasks.length === 0) {
+    addGapTask({
+      field_key: "key_node_rationales",
+      title: "确认关键判断理由",
+      message: "文档已有主要内容，建议优先确认关键节点背后的业务理由。",
+      question: "这里最关键的判断节点是什么，为什么这样判断？",
+      priority: "medium",
+    });
+  }
+
+  return GlobalQualityTriageSchema.parse({
+    summary: "规则诊断发现文档仍需专家补充关键判断、验证或交付信息。",
+    major_gaps,
+    recommended_tasks: recommended_tasks.slice(0, 4),
+    suggested_questions: recommended_tasks.slice(0, 4).map((task) => ({
+      question: task.question,
+      target_field: task.target_field,
+      source_block_ids: task.source_block_ids,
+    })),
+    source_refs,
+  });
+}
+
+export async function runGlobalQualityTriageWithLlmOrFallback(
+  ir: DocumentIR,
+): Promise<{
+  triage: GlobalQualityTriage;
+  triage_mode: GlobalQualityTriageMode;
+  diagnostics: StructuringDiagnostics;
+}> {
+  const diagnostics: StructuringDiagnostics = {
+    attempts: [],
+    quality_issues: [],
+  };
+  if (!isLlmStructuringEnabled()) {
+    diagnostics.llm_failure_reason = "disabled";
+    diagnostics.attempts.push({
+      stage: "global_triage",
+      status: "skipped",
+      reason: "disabled",
+    });
+    diagnostics.attempts.push({ stage: "rules", status: "ok" });
+    return {
+      triage: heuristicGlobalQualityTriage(ir),
+      triage_mode: "rules",
+      diagnostics,
+    };
+  }
+
+  const system = buildGlobalQualityTriageSystemPrompt();
+  const input = buildGlobalQualityTriagePromptInput(ir);
+  const label = "structuring.global_triage";
+  const config = resolveLlmRequestConfig({
+    label,
+    timeoutMs: triageTimeoutMs(),
+  });
+  const attemptBase = {
+    stage: "global_triage" as const,
+    label,
+    provider: config.provider,
+    model: config.model,
+    timeout_ms: config.timeoutMs,
+    system_prompt_chars: system.length,
+    user_prompt_chars: input.prompt.length,
+  };
+  const startedAt = Date.now();
+  try {
+    const raw = await chatCompletionText({
+      system,
+      user: input.prompt,
+      timeoutMs: config.timeoutMs,
+      label,
+      promptDiagnostics: promptDiagnostics("global_triage", input.context),
+    });
+    const parsed = GlobalQualityTriageSchema.parse(
+      normalizeGlobalQualityTriagePayload(extractJsonObject(raw)),
+    );
+    diagnostics.attempts.push({
+      ...attemptBase,
+      status: "ok",
+      elapsed_ms: Date.now() - startedAt,
+    });
+    return {
+      triage: parsed,
+      triage_mode: "llm",
+      diagnostics,
+    };
+  } catch (err) {
+    const { reason, message } =
+      err instanceof SyntaxError
+        ? { reason: "json_parse_error" as const, message: err.message }
+        : classifyLlmError(err);
+    console.info("[EBS Global Quality Triage failed]", {
+      stage: "global_triage",
+      reason,
+      message,
+    });
+    diagnostics.llm_failure_reason = reason;
+    diagnostics.llm_failure_message = message;
+    diagnostics.attempts.push({
+      ...attemptBase,
+      status: "failed",
+      reason,
+      message,
+      elapsed_ms: Date.now() - startedAt,
+    });
+    diagnostics.attempts.push({ stage: "rules", status: "ok" });
+    return {
+      triage: heuristicGlobalQualityTriage(ir),
+      triage_mode: "rules_fallback",
+      diagnostics,
+    };
+  }
 }
 
 export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
@@ -270,11 +621,20 @@ export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
   }
 
   try {
+    const timeoutMs = structuringTimeoutMs();
     let knowledgeSkeleton: unknown;
     try {
-      const skeletonRaw = await chatCompletionText({
-        system: buildKnowledgeSkeletonSystemPrompt(),
-        user: buildKnowledgeSkeletonUserPrompt(ir),
+      const skeletonInput = buildKnowledgeSkeletonPromptInput(ir);
+      const skeletonSystem = buildKnowledgeSkeletonSystemPrompt();
+      const skeletonRaw = await chatCompletionTextWithDashScopeFallback({
+        system: skeletonSystem,
+        user: skeletonInput.prompt,
+        timeoutMs,
+        label: "structuring.knowledge_skeleton",
+        promptDiagnostics: promptDiagnostics(
+          "knowledge_skeleton",
+          skeletonInput.context,
+        ),
       });
       knowledgeSkeleton = extractJsonObject(skeletonRaw);
       diagnostics.attempts.push({ stage: "knowledge_skeleton", status: "ok" });
@@ -283,6 +643,11 @@ export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
         err instanceof SyntaxError
           ? { reason: "json_parse_error" as const, message: err.message }
           : classifyLlmError(err);
+      console.info("[EBS Structuring LLM failed]", {
+        stage: "knowledge_skeleton",
+        reason,
+        message,
+      });
       diagnostics.attempts.push({
         stage: "knowledge_skeleton",
         status: "failed",
@@ -292,12 +657,23 @@ export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
     }
 
     const system = buildStructuringSystemPrompt();
-    const user = buildStructuringUserPrompt(ir, knowledgeSkeleton);
-    const raw = await chatCompletionText({ system, user });
+    const draftInput = buildStructuringPromptInput(ir, knowledgeSkeleton);
+    const raw = await chatCompletionTextWithDashScopeFallback({
+      system,
+      user: draftInput.prompt,
+      timeoutMs,
+      label: "structuring.draft",
+      promptDiagnostics: promptDiagnostics("draft", draftInput.context),
+    });
     let parsed: Record<string, unknown>;
     try {
       parsed = extractJsonObject(raw) as Record<string, unknown>;
     } catch (err) {
+      console.info("[EBS Structuring LLM failed]", {
+        stage: "draft",
+        reason: "json_parse_error",
+        message: err instanceof Error ? err.message : String(err),
+      });
       diagnostics.attempts.push({
         stage: "draft",
         status: "failed",
@@ -321,6 +697,11 @@ export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
       }
 
       diagnostics.quality_issues = qualityIssues;
+      console.info("[EBS Structuring LLM failed]", {
+        stage: "draft",
+        reason: "quality_gate_failed",
+        message: qualityIssues.join("; "),
+      });
       diagnostics.attempts.push({
         stage: "draft",
         status: "failed",
@@ -328,17 +709,25 @@ export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
         message: qualityIssues.join("; "),
       });
 
-      const retryRaw = await chatCompletionText({
+      const retryRaw = await chatCompletionTextWithDashScopeFallback({
         system: buildStructuringSystemPrompt({
           strict: true,
           qualityIssues,
         }),
-        user: buildStructuringUserPrompt(ir, knowledgeSkeleton),
+        user: draftInput.prompt,
+        timeoutMs,
+        label: "structuring.strict_retry",
+        promptDiagnostics: promptDiagnostics("strict_retry", draftInput.context),
       });
       let retryParsed: Record<string, unknown>;
       try {
         retryParsed = extractJsonObject(retryRaw) as Record<string, unknown>;
       } catch (err) {
+        console.info("[EBS Structuring LLM failed]", {
+          stage: "strict_retry",
+          reason: "json_parse_error",
+          message: err instanceof Error ? err.message : String(err),
+        });
         diagnostics.attempts.push({
           stage: "strict_retry",
           status: "failed",
@@ -359,6 +748,11 @@ export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
           .slice(0, 20)
           .map((i) => `${i.path.join(".")}: ${i.message}`);
         diagnostics.schema_issues = schemaIssues;
+        console.info("[EBS Structuring LLM failed]", {
+          stage: "strict_retry",
+          reason: "schema_validation_error",
+          message: schemaIssues.join("; "),
+        });
         diagnostics.attempts.push({
           stage: "strict_retry",
           status: "failed",
@@ -385,6 +779,11 @@ export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
           diagnostics,
         };
       }
+      console.info("[EBS Structuring LLM failed]", {
+        stage: "strict_retry",
+        reason: "quality_gate_failed",
+        message: retryQualityIssues.join("; "),
+      });
       diagnostics.attempts.push({
         stage: "strict_retry",
         status: "failed",
@@ -403,6 +802,11 @@ export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
       .slice(0, 20)
       .map((i) => `${i.path.join(".")}: ${i.message}`);
     diagnostics.schema_issues = schemaIssues;
+    console.info("[EBS Structuring LLM failed]", {
+      stage: "draft",
+      reason: "schema_validation_error",
+      message: schemaIssues.join("; "),
+    });
     diagnostics.attempts.push({
       stage: "draft",
       status: "failed",
@@ -417,6 +821,11 @@ export async function runStructuringWithLlmOrFallback(ir: DocumentIR): Promise<{
     );
   } catch (err) {
     const { reason, message } = classifyLlmError(err);
+    console.info("[EBS Structuring LLM failed]", {
+      stage: "draft",
+      reason,
+      message,
+    });
     diagnostics.attempts.push({
       stage: "draft",
       status: "failed",

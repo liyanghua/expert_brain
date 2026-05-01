@@ -190,6 +190,7 @@ textarea {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 
 .focus-task-bar {
@@ -262,6 +263,17 @@ textarea {
   background:
     linear-gradient(135deg, rgba(91, 140, 255, 0.12), rgba(62, 207, 142, 0.06)),
     #0c0f14;
+}
+
+.conversation-event .quality-inline-panel {
+  margin-bottom: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.quality-timeline-panel {
+  width: 100%;
 }
 
 .quality-inline-header {
@@ -451,11 +463,46 @@ textarea {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  margin: 10px 0 0;
+  margin: 8px 0 0;
   padding: 8px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.03);
+}
+
+.composer-context-card {
+  margin-top: 10px;
+  border: 1px solid rgba(91, 140, 255, 0.2);
+  border-radius: 12px;
+  background: rgba(12, 15, 20, 0.82);
+}
+
+.composer-context-card.collapsed {
+  background: rgba(12, 15, 20, 0.58);
+}
+
+.composer-context-header {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: center;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+.composer-context-header strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.composer-context-header small {
+  color: var(--accent2);
 }
 
 .chat-context-strip span {
@@ -475,9 +522,102 @@ textarea {
 
 .message-list {
   flex: 1;
-  min-height: 220px;
-  overflow: auto;
+  min-height: 0;
+  overflow-y: auto;
   padding-right: 4px;
+}
+
+.conversation-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 4px 8px 0;
+}
+
+.conversation-empty {
+  margin: auto 0;
+  line-height: 1.55;
+}
+
+.conversation-event {
+  display: grid;
+  gap: 8px;
+  max-width: 92%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #0c0f14;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.conversation-event header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: start;
+}
+
+.conversation-event header small,
+.conversation-event > small {
+  color: var(--muted);
+}
+
+.conversation-event p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.event-system {
+  max-width: 100%;
+  border-color: rgba(91, 140, 255, 0.24);
+  background:
+    linear-gradient(135deg, rgba(91, 140, 255, 0.08), rgba(255, 255, 255, 0.02)),
+    #0c0f14;
+}
+
+.event-user {
+  align-self: flex-end;
+  border-color: rgba(91, 140, 255, 0.4);
+  background: rgba(91, 140, 255, 0.12);
+}
+
+.event-agent {
+  align-self: flex-start;
+  border-color: rgba(62, 207, 142, 0.32);
+  background: rgba(62, 207, 142, 0.08);
+}
+
+.event-candidate {
+  max-width: 100%;
+  border-color: rgba(245, 166, 35, 0.38);
+  background:
+    linear-gradient(135deg, rgba(245, 166, 35, 0.08), rgba(62, 207, 142, 0.04)),
+    #0c0f14;
+}
+
+.event-note {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.event-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.gt-candidate-card header span {
+  display: block;
+  color: var(--accent2);
+  font-size: 12px;
+  margin-bottom: 2px;
+}
+
+.event-candidate .gt-candidate-card {
+  border: 0;
+  padding: 0;
+  background: transparent;
 }
 
 .chat-input {

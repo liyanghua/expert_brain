@@ -3,6 +3,7 @@ import type { DocumentIR } from "@ebs/document-ir";
 import type {
   ExpertNote,
   GTCandidate,
+  GlobalQualityTriage,
   GroundTruthDraft,
   GroundTruthFieldItem,
   SuggestionRecord,
@@ -69,7 +70,12 @@ type ParseDiagnostics = {
 
 type StructuringDiagnostics = {
   attempts?: {
-    stage: "knowledge_skeleton" | "draft" | "strict_retry" | "rules";
+    stage:
+      | "global_triage"
+      | "knowledge_skeleton"
+      | "draft"
+      | "strict_retry"
+      | "rules";
     status: "ok" | "failed" | "skipped";
     reason?: string;
     message?: string;
@@ -85,6 +91,8 @@ type ExtractResponse = {
   scorecard?: EvalScorecard;
   improvement_plan?: EvalPlan;
   structuring_mode?: string;
+  quality_triage_mode?: string;
+  global_quality_triage?: GlobalQualityTriage;
   parse_diagnostics?: ParseDiagnostics;
   structuring_diagnostics?: StructuringDiagnostics;
 };
@@ -126,6 +134,7 @@ type ChatMessage = {
   id: string;
   role: "user" | "agent";
   text: string;
+  createdAt?: string;
   qa?: QAResponse;
   question?: string;
   blockId?: string | null;
@@ -193,8 +202,6 @@ type ExpertNoteListResponse = {
   notes: ExpertNote[];
 };
 
-type StudioTab = "groundTruth" | "quality" | "transform";
-
 type LlmProgressStatus = "idle" | "running" | "success" | "error";
 
 type LlmProgress = {
@@ -205,6 +212,7 @@ type LlmProgress = {
   message: string;
   diagnostics?: StructuringDiagnostics;
   parseDiagnostics?: ParseDiagnostics;
+  globalQualityTriage?: GlobalQualityTriage;
 };
 
 type QuestionRefineProgress = {
@@ -218,14 +226,57 @@ type QuestionRefineProgress = {
   rationale?: string;
 };
 
+type ConversationEvent =
+  | {
+      id: string;
+      kind: "step";
+      at: string;
+      sort: number;
+      thread: TaskThread;
+      step: ThreadStep;
+    }
+  | {
+      id: string;
+      kind: "candidate";
+      at: string;
+      sort: number;
+      candidate: GTCandidate;
+    }
+  | {
+      id: string;
+      kind: "note";
+      at: string;
+      sort: number;
+      note: ExpertNote;
+    }
+  | {
+      id: string;
+      kind: "message";
+      at: string;
+      sort: number;
+      message: ChatMessage;
+    }
+  | {
+      id: string;
+      kind: "question_refine_progress";
+      at: string;
+      sort: number;
+      progress: QuestionRefineProgress;
+    }
+  | {
+      id: string;
+      kind: "quality_progress";
+      at: string;
+      sort: number;
+      progress: LlmProgress;
+    };
+
 type ParseStatus = "idle" | "uploading" | "processing" | "waiting_ir" | "ready";
 
 const LLM_STEPS = [
-  "识别文档质量缺口",
-  "提炼专家知识骨架",
-  "映射结构化字段",
-  "校验可用性与出处",
-  "生成质量建议",
+  "读取文档结构",
+  "发现主要质量缺口",
+  "生成推荐任务",
 ] as const;
 
 const QUESTION_REFINE_STEPS = [
@@ -311,16 +362,16 @@ function summarizeContent(content: unknown, maxLength = 260) {
 
 function stepLabel(step: ThreadStep) {
   const labels: Record<ThreadStep["type"], string> = {
-    task_started: "任务启动",
-    question_suggested: "系统推荐问题",
-    question_edited: "用户改写问题",
-    question_sent: "用户实际提问",
+    task_started: "Agent 建议下一步",
+    question_suggested: "Agent 生成了追问草稿",
+    question_edited: "你调整了问题",
+    question_sent: "你提问",
     agent_answered: "Agent 回答",
-    note_saved: "专家笔记",
-    gt_candidate_created: "GT 候选生成",
-    writeback_confirmed: "写回确认",
-    writeback_rejected: "写回拒绝",
-    task_completed: "任务完成",
+    note_saved: "保存为专家笔记",
+    gt_candidate_created: "生成候选补充内容",
+    writeback_confirmed: "已写入结构化草稿",
+    writeback_rejected: "暂不采用候选内容",
+    task_completed: "处理完成",
   };
   return labels[step.type] ?? step.type;
 }
@@ -337,6 +388,30 @@ function stepSummary(step: ThreadStep) {
     payload.rationale ??
     payload;
   return summarizeContent(value, 320);
+}
+
+function dateToSort(value: string | undefined, fallback = 0) {
+  const timestamp = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(timestamp) ? timestamp : fallback;
+}
+
+function candidateStatusLabel(status: GTCandidate["status"]) {
+  const labels: Record<GTCandidate["status"], string> = {
+    draft: "待确认",
+    confirmed: "已写入",
+    rejected: "暂不采用",
+    edited: "已编辑",
+  };
+  return labels[status] ?? status;
+}
+
+function sourceBlockSummary(candidate: GTCandidate) {
+  return (
+    candidate.source_refs
+      .map((ref) => ref.block_id)
+      .filter(Boolean)
+      .join(", ") || "暂无来源 block"
+  );
 }
 
 type LeftMode = "original" | "structured" | "compare";
@@ -397,7 +472,6 @@ export function App() {
   const [threads, setThreads] = useState<TaskThread[]>([]);
   const [gtCandidates, setGtCandidates] = useState<GTCandidate[]>([]);
   const [expertNotes, setExpertNotes] = useState<ExpertNote[]>([]);
-  const [studioTab, setStudioTab] = useState<StudioTab>("groundTruth");
   const [candidateEdits, setCandidateEdits] = useState<Record<string, string>>({});
   const [candidateModes, setCandidateModes] = useState<
     Record<string, "append" | "replace">
@@ -420,6 +494,7 @@ export function App() {
   const [questionRefineProgress, setQuestionRefineProgress] =
     useState<QuestionRefineProgress>(idleQuestionRefineProgress);
   const [statusbarExpanded, setStatusbarExpanded] = useState(false);
+  const [contextStripExpanded, setContextStripExpanded] = useState(false);
 
   const isInteractionLocked =
     isUploading || llmProgress.status === "running";
@@ -721,7 +796,7 @@ export function App() {
     (activeFieldQuality
       ? `请补充“${activeFieldQuality.label}”：${activeFieldQuality.definition}`
       : selectedBlock
-        ? "请判断这段原文是否能补充当前 GroundTruth，并给出可回写内容。"
+        ? "请判断这段原文是否能补充当前结构化草稿，并给出可写入内容。"
         : "");
 
   const sortedThreads = useMemo(
@@ -741,19 +816,147 @@ export function App() {
           : true),
     ) ?? sortedThreads[0];
 
-  const activeThreadCandidates = useMemo(
-    () =>
-      gtCandidates.filter(
-        (candidate) =>
-          candidate.thread_id === activeThread?.thread_id ||
-          (!activeThread && candidate.status === "draft"),
-      ),
-    [activeThread, gtCandidates],
-  );
+  const conversationEvents = useMemo<ConversationEvent[]>(() => {
+    const events: ConversationEvent[] = [];
+    const candidateIds = new Set(gtCandidates.map((candidate) => candidate.candidate_id));
+    const noteIds = new Set(expertNotes.map((note) => note.note_id));
+    const representedQuestions = new Set<string>();
+    const representedAnswers = new Set<string>();
 
-  const latestDraftCandidate =
-    gtCandidates.find((candidate) => candidate.status === "draft") ??
-    activeThreadCandidates[0];
+    for (const thread of threads) {
+      for (const step of thread.steps) {
+        const payload = step.payload as Record<string, unknown>;
+        const question =
+          typeof payload.question === "string"
+            ? payload.question
+            : typeof payload.refined_question === "string"
+              ? payload.refined_question
+              : null;
+        const answer = typeof payload.answer === "string" ? payload.answer : null;
+        if (question) representedQuestions.add(question);
+        if (answer) representedAnswers.add(answer);
+        if (
+          step.type === "gt_candidate_created" &&
+          typeof payload.candidate_id === "string" &&
+          candidateIds.has(payload.candidate_id)
+        ) {
+          continue;
+        }
+        if (
+          step.type === "note_saved" &&
+          typeof payload.note_id === "string" &&
+          noteIds.has(payload.note_id)
+        ) {
+          continue;
+        }
+        events.push({
+          id: `step-${step.step_id}`,
+          kind: "step",
+          at: step.timestamp,
+          sort: dateToSort(step.timestamp),
+          thread,
+          step,
+        });
+      }
+
+      if (thread.steps.length === 0) {
+        events.push({
+          id: `thread-${thread.thread_id}`,
+          kind: "step",
+          at: thread.created_at,
+          sort: dateToSort(thread.created_at),
+          thread,
+          step: {
+            step_id: `thread-${thread.thread_id}-task`,
+            thread_id: thread.thread_id,
+            type: "task_started",
+            timestamp: thread.created_at,
+            payload: {
+              field_key: thread.field_key,
+              recommended_question: thread.recommended_question,
+            },
+          },
+        });
+      }
+    }
+
+    for (const candidate of gtCandidates) {
+      events.push({
+        id: `candidate-${candidate.candidate_id}`,
+        kind: "candidate",
+        at: candidate.created_at,
+        sort: dateToSort(candidate.created_at),
+        candidate,
+      });
+    }
+
+    for (const note of expertNotes) {
+      events.push({
+        id: `note-${note.note_id}`,
+        kind: "note",
+        at: note.created_at,
+        sort: dateToSort(note.created_at),
+        note,
+      });
+    }
+
+    messages.forEach((message, index) => {
+      const createdAt = message.createdAt ?? new Date(Date.now() + index).toISOString();
+      const isRepresentedUserQuestion =
+        message.role === "user" && representedQuestions.has(message.text);
+      const isRepresentedAgentAnswer =
+        message.role === "agent" && representedAnswers.has(message.text);
+      const isLiveMessage = message.status === "pending" || message.status === "error";
+      if (!isLiveMessage && (isRepresentedUserQuestion || isRepresentedAgentAnswer)) {
+        return;
+      }
+      events.push({
+        id: `message-${message.id}`,
+        kind: "message",
+        at: createdAt,
+        sort: dateToSort(createdAt, Date.now() + index),
+        message,
+      });
+    });
+
+    if (
+      questionRefineProgress.status === "running" ||
+      questionRefineProgress.status === "error"
+    ) {
+      const at = questionRefineProgress.startedAt
+        ? new Date(questionRefineProgress.startedAt).toISOString()
+        : new Date().toISOString();
+      events.push({
+        id: "question-refine-progress",
+        kind: "question_refine_progress",
+        at,
+        sort: questionRefineProgress.startedAt ?? Date.now(),
+        progress: questionRefineProgress,
+      });
+    }
+
+    if (llmProgress.status !== "idle") {
+      const at = llmProgress.startedAt
+        ? new Date(llmProgress.startedAt).toISOString()
+        : new Date().toISOString();
+      events.push({
+        id: "quality-progress",
+        kind: "quality_progress",
+        at,
+        sort: llmProgress.startedAt ?? Date.now(),
+        progress: llmProgress,
+      });
+    }
+
+    return events.sort((a, b) => a.sort - b.sort || a.id.localeCompare(b.id));
+  }, [
+    expertNotes,
+    gtCandidates,
+    llmProgress,
+    messages,
+    questionRefineProgress,
+    threads,
+  ]);
 
   const metricRows = useMemo<MetricTableRow[]>(() => {
     if (!scorecard) return [];
@@ -843,7 +1046,6 @@ export function App() {
     setThreads([]);
     setGtCandidates([]);
     setExpertNotes([]);
-    setStudioTab("groundTruth");
     setNoteDraft("");
     await refreshDoc(m.doc_id);
   }
@@ -905,11 +1107,14 @@ export function App() {
         startedAt,
         elapsedMs: Date.now() - startedAt,
         message:
-          r.structuring_mode === "llm"
-            ? "质量检测完成，已通过结构化质量检查"
-            : "已完成质量检测，但使用了规则兜底",
+          r.quality_triage_mode === "llm"
+            ? "轻量质量检测完成，已生成主要缺口和推荐任务"
+            : r.quality_triage_mode === "deep_structuring"
+              ? "深度结构化抽取完成"
+              : "轻量质量检测完成，已使用本地规则生成推荐任务",
         diagnostics: r.structuring_diagnostics,
         parseDiagnostics: r.parse_diagnostics,
+        globalQualityTriage: r.global_quality_triage,
       });
       void refreshDoc(docId);
     } catch (err) {
@@ -943,7 +1148,7 @@ export function App() {
     ]);
     const questionSeed =
       (qaContext.questionSeed ?? focusRecommendedQuestion) ||
-      "请结合当前焦点任务和证据原文，给出可回写到 GroundTruth 的专家答案。";
+      "请结合当前处理任务和证据原文，给出可写入结构化草稿的专家答案。";
     const gapReason =
       qaContext.gapReason ?? focusContext.gapMessage ?? activeFieldQuality?.reason ?? null;
     return {
@@ -968,6 +1173,7 @@ export function App() {
       return;
     }
     const q = input.trim();
+    const askedAt = new Date().toISOString();
     const contextSnapshot = buildCurrentQaContextSnapshot();
     const qaPayload = buildQaContextPayload(q, contextSnapshot);
     setInput("");
@@ -978,6 +1184,7 @@ export function App() {
         id: crypto.randomUUID(),
         role: "user",
         text: q,
+        createdAt: askedAt,
         blockId: contextSnapshot.blockId,
         targetField: contextSnapshot.targetField,
       },
@@ -990,6 +1197,7 @@ export function App() {
         id: pendingId,
         role: "agent",
         text: "QA Agent 正在结合焦点任务、证据原文和专家偏好思考...",
+        createdAt: new Date().toISOString(),
         question: q,
         blockId: contextSnapshot.blockId,
         targetField: contextSnapshot.targetField,
@@ -1013,6 +1221,7 @@ export function App() {
                 id: pendingId,
                 role: "agent",
                 text: qa.direct_answer,
+                createdAt: new Date().toISOString(),
                 qa,
                 question: q,
                 blockId: contextSnapshot.blockId,
@@ -1171,7 +1380,7 @@ export function App() {
           row?.candidateQuestions[0]?.question ??
           (fieldKey
             ? `请基于这段原文补充“${FIELD_LABELS[fieldKey] ?? fieldKey}”。`
-            : "请判断这段原文能补充哪个 GroundTruth 字段，并给出可回写内容。"),
+            : "请判断这段原文能补充哪个结构化字段，并给出可写入内容。"),
         metric: prev.metric,
       };
     });
@@ -1190,7 +1399,7 @@ export function App() {
       threadId: qaContext.threadId ?? activeThread?.thread_id ?? null,
       questionSeed:
         focusRecommendedQuestion ||
-        "请结合当前焦点任务和证据原文，给出可回写到 GroundTruth 的专家答案。",
+        "请结合当前处理任务和证据原文，给出可写入结构化草稿的专家答案。",
       gapReason: focusContext.gapMessage ?? activeFieldQuality?.reason ?? null,
     };
     setQaContext(contextSnapshot);
@@ -1289,6 +1498,7 @@ export function App() {
         id: crypto.randomUUID(),
         role: "agent",
         text: `已基于当前证据生成 ${sug.suggestions.length} 条补写建议，可在底部“待确认建议”查看。`,
+        createdAt: new Date().toISOString(),
       },
     ]);
   }
@@ -1359,11 +1569,11 @@ export function App() {
       if (result.improvement_plan) setImprovementPlan(result.improvement_plan);
       setCandidateStatus((s) => ({ ...s, [candidate.candidate_id]: "success" }));
       setActiveFieldKey(candidate.field_key);
-      setSaveHint(`已确认 GT 候选：${FIELD_LABELS[candidate.field_key] ?? candidate.field_key}`);
+      setSaveHint(`已确认候选补充：${FIELD_LABELS[candidate.field_key] ?? candidate.field_key}`);
       await refreshDoc(docId);
     } catch (err) {
       setCandidateStatus((s) => ({ ...s, [candidate.candidate_id]: "error" }));
-      setSaveHint(err instanceof Error ? err.message : "GT 候选确认失败");
+      setSaveHint(err instanceof Error ? err.message : "候选补充确认失败");
     }
   }
 
@@ -1376,11 +1586,11 @@ export function App() {
         { method: "POST", body: "{}" },
       );
       setCandidateStatus((s) => ({ ...s, [candidate.candidate_id]: "success" }));
-      setSaveHint("已拒绝 GT 候选");
+      setSaveHint("已暂不采用候选补充");
       await refreshDoc(docId);
     } catch (err) {
       setCandidateStatus((s) => ({ ...s, [candidate.candidate_id]: "error" }));
-      setSaveHint(err instanceof Error ? err.message : "GT 候选拒绝失败");
+      setSaveHint(err instanceof Error ? err.message : "候选补充处理失败");
     }
   }
 
@@ -1396,9 +1606,314 @@ export function App() {
       }),
     });
     setNoteDraft("");
-    setStudioTab("groundTruth");
     setSaveHint("已保存专家笔记");
     await refreshDoc(docId);
+  }
+
+  async function saveCandidateAsExpertNote(candidate: GTCandidate) {
+    if (!docId || isInteractionLocked) return;
+    const content =
+      candidateEdits[candidate.candidate_id] ?? summarizeContent(candidate.content, 1200);
+    await fetchJson<ExpertNote>(api(`/documents/${docId}/notes`), {
+      method: "POST",
+      body: JSON.stringify({
+        thread_id: candidate.thread_id ?? activeThread?.thread_id ?? null,
+        content,
+        source_block_ids: candidate.source_refs
+          .map((ref) => ref.block_id)
+          .filter(Boolean),
+      }),
+    });
+    setSaveHint("已保存为专家笔记");
+    await refreshDoc(docId);
+  }
+
+  function useThreadQuestion(thread: TaskThread, question: string) {
+    setInput(question);
+    setQaContext({
+      blockId: thread.source_block_ids[0] ?? null,
+      targetField: thread.field_key,
+      evidenceBlockIds: thread.source_block_ids,
+      questionSeed: question,
+      threadId: thread.thread_id,
+    });
+    if (thread.field_key) setActiveFieldKey(thread.field_key);
+  }
+
+  function renderQuestionRefineProgress(progress: QuestionRefineProgress) {
+    return (
+      <section className={`quality-inline-panel question-refine-panel ${progress.status}`}>
+        <div className="quality-inline-header">
+          <span className="llm-pulse" />
+          <div>
+            <strong>追问改写 Agent 正在生成问题草稿</strong>
+            <p>
+              {progress.message}
+              {progress.elapsedMs > 0
+                ? ` · ${Math.round(progress.elapsedMs / 1000)}s`
+                : ""}
+            </p>
+          </div>
+        </div>
+        <div className="llm-steps" aria-label="问题草稿生成过程">
+          {QUESTION_REFINE_STEPS.map((step, i) => (
+            <span
+              key={step}
+              className={
+                i < progress.stepIndex
+                  ? "done"
+                  : i === progress.stepIndex
+                    ? "active"
+                    : ""
+              }
+            >
+              {step}
+            </span>
+          ))}
+        </div>
+        <div className="llm-diagnostics">
+          {progress.contextSummary ??
+            `证据 ${focusEvidenceBlocks.length} 个 block${
+              activeFieldQuality ? ` · 目标字段：${activeFieldQuality.label}` : ""
+            }`}
+        </div>
+      </section>
+    );
+  }
+
+  function renderQualityProgress(progress: LlmProgress) {
+    return (
+      <section
+        className={`quality-inline-panel quality-timeline-panel ${progress.status} ${
+          statusbarExpanded ? "expanded" : "compact"
+        }`}
+      >
+        <div className="quality-inline-header">
+          <span className="llm-pulse" />
+          <div>
+            <strong>质量检测 Agent 轻量全局诊断</strong>
+            <p>
+              {progress.message}
+              {progress.elapsedMs > 0
+                ? ` · ${Math.round(progress.elapsedMs / 1000)}s`
+                : ""}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="statusbar-toggle"
+            onClick={() => setStatusbarExpanded((v) => !v)}
+          >
+            {statusbarExpanded ? "收起" : "展开"}
+          </button>
+        </div>
+        <div className="llm-steps" aria-label="质量检测过程">
+          {LLM_STEPS.map((step, i) => (
+            <span
+              key={step}
+              className={
+                i < progress.stepIndex
+                  ? "done"
+                  : i === progress.stepIndex
+                    ? "active"
+                    : ""
+              }
+            >
+              {step}
+            </span>
+          ))}
+        </div>
+        <div className="llm-diagnostics">
+          {progress.globalQualityTriage?.summary
+            ? `${progress.globalQualityTriage.summary}${
+                llmAttemptSummary ? ` · ${llmAttemptSummary}` : ""
+              }`
+            : llmAttemptSummary ||
+              (progress.parseDiagnostics?.block_counts
+                ? `切块 ${JSON.stringify(progress.parseDiagnostics.block_counts)}`
+                : "质量检测会先发现主要问题，并把深入补全交给后续局部追问。")}
+        </div>
+      </section>
+    );
+  }
+
+  function renderCandidateCard(candidate: GTCandidate) {
+    const isRunning = candidateStatus[candidate.candidate_id] === "running";
+    const isDraft = candidate.status === "draft";
+    return (
+      <article className={`gt-candidate-card candidate-${candidate.status}`}>
+        <header>
+          <div>
+            <span>候选补充内容</span>
+            <strong>{FIELD_LABELS[candidate.field_key] ?? candidate.field_key}</strong>
+          </div>
+          <small>{candidateStatusLabel(candidate.status)}</small>
+        </header>
+        <textarea
+          value={
+            candidateEdits[candidate.candidate_id] ??
+            summarizeContent(candidate.content, 800)
+          }
+          disabled={isInteractionLocked || !isDraft || isRunning}
+          onChange={(e) =>
+            setCandidateEdits((edits) => ({
+              ...edits,
+              [candidate.candidate_id]: e.target.value,
+            }))
+          }
+        />
+        <small>来源 block：{sourceBlockSummary(candidate)}</small>
+        {candidate.rationale && <small>依据：{candidate.rationale}</small>}
+        <div className="qa-button-row">
+          <select
+            value={candidateModes[candidate.candidate_id] ?? candidate.recommended_mode}
+            disabled={isInteractionLocked || !isDraft || isRunning}
+            onChange={(e) =>
+              setCandidateModes((modes) => ({
+                ...modes,
+                [candidate.candidate_id]: e.target.value as "append" | "replace",
+              }))
+            }
+          >
+            <option value="append">追加到字段</option>
+            <option value="replace">替换字段</option>
+          </select>
+          <button
+            type="button"
+            disabled={isInteractionLocked || !isDraft || isRunning}
+            onClick={() => void confirmGTCandidate(candidate)}
+          >
+            {isRunning ? "处理中..." : "确认写入"}
+          </button>
+          <button
+            type="button"
+            disabled={isInteractionLocked || !isDraft || isRunning}
+            onClick={() => void rejectGTCandidate(candidate)}
+          >
+            暂不采用
+          </button>
+          <button
+            type="button"
+            disabled={isInteractionLocked || isRunning}
+            onClick={() => void saveCandidateAsExpertNote(candidate)}
+          >
+            保存为专家笔记
+          </button>
+        </div>
+        {candidate.status === "confirmed" && (
+          <small className="writeback-hint success">已写入结构化草稿。</small>
+        )}
+      </article>
+    );
+  }
+
+  function renderStepEvent(thread: TaskThread, step: ThreadStep, key?: string) {
+    const payload = step.payload as Record<string, unknown>;
+    const question =
+      typeof payload.refined_question === "string"
+        ? payload.refined_question
+        : typeof payload.question === "string"
+          ? payload.question
+          : typeof payload.recommended_question === "string"
+            ? payload.recommended_question
+            : thread.recommended_question;
+    const fieldKey = typeof payload.field_key === "string" ? payload.field_key : thread.field_key;
+    const eventClass =
+      step.type === "question_sent"
+        ? "event-user"
+        : step.type === "agent_answered"
+          ? "event-agent"
+          : step.type === "note_saved"
+            ? "event-note"
+            : "event-system";
+
+    return (
+      <article key={key} className={`conversation-event ${eventClass} step-${step.type}`}>
+        <header>
+          <strong>{stepLabel(step)}</strong>
+          <small>
+            {fieldKey ? FIELD_LABELS[fieldKey] ?? fieldKey : "当前处理记录"} ·{" "}
+            {thread.source_block_ids.length} 个证据
+          </small>
+        </header>
+        <p>{stepSummary(step)}</p>
+        {(step.type === "task_started" || step.type === "question_suggested") &&
+          question && (
+            <div className="event-actions">
+              <button
+                type="button"
+                disabled={isInteractionLocked || isQuestionRefining}
+                onClick={() => useThreadQuestion(thread, question)}
+              >
+                使用这个问题
+              </button>
+              <button
+                type="button"
+                disabled={isInteractionLocked || isQuestionRefining}
+                onClick={() => void askWithFocus()}
+              >
+                重新生成追问草稿
+              </button>
+            </div>
+          )}
+      </article>
+    );
+  }
+
+  function renderConversationEvent(event: ConversationEvent) {
+    if (event.kind === "quality_progress") {
+      return (
+        <article key={event.id} className="conversation-event event-system">
+          {renderQualityProgress(event.progress)}
+        </article>
+      );
+    }
+    if (event.kind === "question_refine_progress") {
+      return (
+        <article key={event.id} className="conversation-event event-agent">
+          {renderQuestionRefineProgress(event.progress)}
+        </article>
+      );
+    }
+    if (event.kind === "candidate") {
+      return (
+        <article
+          key={event.id}
+          className="conversation-event event-candidate"
+        >
+          {renderCandidateCard(event.candidate)}
+        </article>
+      );
+    }
+    if (event.kind === "note") {
+      return (
+        <article key={event.id} className="conversation-event event-note">
+          <header>
+            <strong>专家笔记</strong>
+            <small>{event.note.source_block_ids.length} 个来源证据</small>
+          </header>
+          <p>{event.note.content}</p>
+        </article>
+      );
+    }
+    if (event.kind === "message") {
+      return (
+        <article
+          key={event.id}
+          className={`conversation-event ${
+            event.message.role === "user" ? "event-user" : "event-agent"
+          } ${event.message.status ?? ""}`}
+        >
+          <header>
+            <strong>{event.message.role === "user" ? "你" : "Agent"}</strong>
+            {event.message.status === "pending" && <small>正在处理</small>}
+            {event.message.status === "error" && <small>需要重试</small>}
+          </header>
+          <p>{event.message.text}</p>
+        </article>
+      );
+    }
+    return renderStepEvent(event.thread, event.step, event.id);
   }
 
   return (
@@ -1726,7 +2241,7 @@ export function App() {
         <section className="pane collaboration-pane">
           <div className="context-bar focus-task-bar">
             <div className="focus-task-header">
-              <span>Focus Task</span>
+              <span>当前处理任务</span>
               <strong>
                 {activeFieldQuality
                   ? activeFieldQuality.label
@@ -1785,457 +2300,59 @@ export function App() {
             </div>
           </div>
 
-          {llmProgress.status !== "idle" && (
-            <section
-              className={`quality-inline-panel ${llmProgress.status} ${
-                statusbarExpanded ? "expanded" : "compact"
-              }`}
-            >
-              <div className="quality-inline-header">
-                <span className="llm-pulse" />
-                <div>
-                  <strong>质量优化 Agent 正在检测文档</strong>
-                  <p>
-                    {llmProgress.message}
-                    {llmProgress.elapsedMs > 0
-                      ? ` · ${Math.round(llmProgress.elapsedMs / 1000)}s`
-                      : ""}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className="statusbar-toggle"
-                  onClick={() => setStatusbarExpanded((v) => !v)}
-                >
-                  {statusbarExpanded ? "收起" : "展开"}
-                </button>
-              </div>
-              <div className="llm-steps" aria-label="质量检测过程">
-                {LLM_STEPS.map((step, i) => (
-                  <span
-                    key={step}
-                    className={
-                      i < llmProgress.stepIndex
-                        ? "done"
-                        : i === llmProgress.stepIndex
-                          ? "active"
-                          : ""
-                    }
-                  >
-                    {step}
-                  </span>
-                ))}
-              </div>
-              <div className="llm-diagnostics">
-                {llmAttemptSummary ||
-                  (llmProgress.parseDiagnostics?.block_counts
-                    ? `切块 ${JSON.stringify(llmProgress.parseDiagnostics.block_counts)}`
-                    : "质量检测会基于 schema、评分指标和专家偏好推进文档质量。")}
-              </div>
-            </section>
-          )}
-
-          <section className="studio-panel">
-            <div className="studio-tabs">
-              {(
-                [
-                  ["groundTruth", "GroundTruth"],
-                  ["quality", "Quality"],
-                  ["transform", "Transform"],
-                ] as const
-              ).map(([id, label]) => (
-                <button
-                  key={id}
-                  type="button"
-                  className={studioTab === id ? "active" : ""}
-                  disabled={isInteractionLocked}
-                  onClick={() => setStudioTab(id)}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            {studioTab === "groundTruth" && (
-              <div className="studio-body">
-                <header className="studio-summary">
-                  <strong>GroundTruth 候选</strong>
-                  <span>
-                    {gtCandidates.filter((c) => c.status === "draft").length} 个待确认
-                  </span>
-                </header>
-                {(activeThreadCandidates.length ? activeThreadCandidates : gtCandidates)
-                  .slice(0, 3)
-                  .map((candidate) => (
-                    <article
-                      key={candidate.candidate_id}
-                      className={`gt-candidate-card candidate-${candidate.status}`}
-                    >
-                      <header>
-                        <strong>
-                          {FIELD_LABELS[candidate.field_key] ?? candidate.field_key}
-                        </strong>
-                        <span>{candidate.status}</span>
-                      </header>
-                      <textarea
-                        value={
-                          candidateEdits[candidate.candidate_id] ??
-                          summarizeContent(candidate.content, 800)
-                        }
-                        disabled={
-                          isInteractionLocked ||
-                          candidate.status !== "draft" ||
-                          candidateStatus[candidate.candidate_id] === "running"
-                        }
-                        onChange={(e) =>
-                          setCandidateEdits((edits) => ({
-                            ...edits,
-                            [candidate.candidate_id]: e.target.value,
-                          }))
-                        }
-                      />
-                      <small>
-                        来源 blocks:{" "}
-                        {candidate.source_refs
-                          .map((ref) => ref.block_id)
-                          .filter(Boolean)
-                          .join(", ") || "—"}
-                      </small>
-                      <div className="qa-button-row">
-                        <select
-                          value={
-                            candidateModes[candidate.candidate_id] ??
-                            candidate.recommended_mode
-                          }
-                          disabled={
-                            isInteractionLocked ||
-                            candidate.status !== "draft" ||
-                            candidateStatus[candidate.candidate_id] === "running"
-                          }
-                          onChange={(e) =>
-                            setCandidateModes((modes) => ({
-                              ...modes,
-                              [candidate.candidate_id]: e.target.value as
-                                | "append"
-                                | "replace",
-                            }))
-                          }
-                        >
-                          <option value="append">追加到字段</option>
-                          <option value="replace">替换字段</option>
-                        </select>
-                        <button
-                          type="button"
-                          disabled={
-                            isInteractionLocked ||
-                            candidate.status !== "draft" ||
-                            candidateStatus[candidate.candidate_id] === "running"
-                          }
-                          onClick={() => void confirmGTCandidate(candidate)}
-                        >
-                          确认写回
-                        </button>
-                        <button
-                          type="button"
-                          disabled={
-                            isInteractionLocked ||
-                            candidate.status !== "draft" ||
-                            candidateStatus[candidate.candidate_id] === "running"
-                          }
-                          onClick={() => void rejectGTCandidate(candidate)}
-                        >
-                          拒绝
-                        </button>
-                      </div>
-                    </article>
-                  ))}
-                {gtCandidates.length === 0 && (
-                  <div className="empty-state compact">
-                    QA 回答后会在这里形成可确认的 GT 候选。
-                  </div>
-                )}
-                <div className="note-composer">
-                  <textarea
-                    value={noteDraft}
-                    placeholder="记录专家补充说明，不直接写入 GroundTruth。"
-                    disabled={isInteractionLocked}
-                    onChange={(e) => setNoteDraft(e.target.value)}
-                  />
-                  <button
-                    type="button"
-                    disabled={isInteractionLocked || !noteDraft.trim()}
-                    onClick={() => void saveExpertNote()}
-                  >
-                    保存为笔记
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {studioTab === "quality" && (
-              <div className="studio-body">
-                <strong>Quality 任务队列</strong>
-                {focusTaskRows.slice(0, 4).map((row) => (
-                  <button
-                    key={row.fieldKey}
-                    type="button"
-                    className={`focus-task-item field-status-${row.status} ${
-                      activeFieldQuality?.fieldKey === row.fieldKey ? "active" : ""
-                    }`}
-                    disabled={isInteractionLocked}
-                    onClick={() =>
-                      focusField(row, row.status === "covered" ? "field" : "gap")
-                    }
-                  >
-                    <span>{row.label}</span>
-                    <small>{row.statusLabel} · {row.reason}</small>
-                  </button>
-                ))}
-                <small>
-                  指标：{metricRows.slice(0, 3).map((row) => `${row.name} ${row.value}`).join(" · ") || "等待质量检测"}
-                </small>
-              </div>
-            )}
-
-            {studioTab === "transform" && (
-              <div className="studio-body">
-                <strong>Transform 派生产物</strong>
-                <p>结构化导出、PPT、音频和思维导图会在 GroundTruth 稳定后进入这里。</p>
-              </div>
-            )}
-          </section>
-
-          <div className="message-list">
-            {sortedThreads.length > 0 ? (
-              sortedThreads.map((thread) => (
-                <article
-                  key={thread.thread_id}
-                  className={`thread-card thread-${thread.status}`}
-                >
-                  <header>
-                    <div>
-                      <span>Task Thread</span>
-                      <strong>{thread.title}</strong>
-                    </div>
-                    <small>
-                      {thread.field_key
-                        ? FIELD_LABELS[thread.field_key] ?? thread.field_key
-                        : "未绑定字段"}{" "}
-                      · {thread.source_block_ids.length} 个证据
-                    </small>
-                  </header>
-                  {thread.recommended_question && (
-                    <div className="thread-recommendation">
-                      推荐问题：{thread.recommended_question}
-                    </div>
-                  )}
-                  <div className="thread-steps">
-                    {thread.steps.map((step) => (
-                      <div key={step.step_id} className={`thread-step step-${step.type}`}>
-                        <span>{stepLabel(step)}</span>
-                        <p>{stepSummary(step)}</p>
-                      </div>
-                    ))}
-                  </div>
-                  {gtCandidates.some(
-                    (candidate) => candidate.thread_id === thread.thread_id,
-                  ) && (
-                    <small className="thread-candidate-hint">
-                      已生成 GT 候选，请在右侧 GroundTruth 中确认。
-                    </small>
-                  )}
-                </article>
-              ))
+          <div className="message-list conversation-timeline">
+            {conversationEvents.length > 0 ? (
+              conversationEvents.map((event) => renderConversationEvent(event))
             ) : (
-              messages.map((m) => (
-              <div key={m.id} className={`msg ${m.role} ${m.status ?? ""}`}>
-                {editingMessageId === m.id ? (
-                  <textarea
-                    className="qa-inline-editor"
-                    value={editingAnswer}
-                    disabled={writebackStatus[m.id] === "running"}
-                    onChange={(e) => setEditingAnswer(e.target.value)}
-                  />
-                ) : (
-                  m.text
-                )}
-                {m.qa && (
-                  <div className="qa-actions">
-                    {m.qa.refined_question && (
-                      <small className="refined-question">
-                        实际追问：{m.qa.refined_question}
-                      </small>
-                    )}
-                    <small>
-                      引用 blocks: {m.qa.source_block_refs.join(", ") || "—"}
-                      {m.qa.target_field
-                        ? ` · 建议回写：${FIELD_LABELS[m.qa.target_field] ?? m.qa.target_field}`
-                        : " · 请选择回写字段"}
-                    </small>
-                    <label className="writeback-control">
-                      <span>目标字段</span>
-                      <select
-                        value={
-                          writebackTargets[m.id] ||
-                          m.qa.suggested_writeback?.field_key ||
-                          m.qa.target_field ||
-                          m.targetField ||
-                          ""
-                        }
-                        disabled={isInteractionLocked || writebackStatus[m.id] === "running"}
-                        onChange={(e) =>
-                          setWritebackTargets((targets) => ({
-                            ...targets,
-                            [m.id]: e.target.value,
-                          }))
-                        }
-                      >
-                        <option value="">选择 schema 字段</option>
-                        {GROUND_TRUTH_FIELD_KEYS.map((key) => (
-                          <option key={key} value={key}>
-                            {FIELD_LABELS[key] ?? key}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="writeback-control">
-                      <span>回写方式</span>
-                      <select
-                        value={writebackModes[m.id] ?? "append"}
-                        disabled={isInteractionLocked || writebackStatus[m.id] === "running"}
-                        onChange={(e) =>
-                          setWritebackModes((modes) => ({
-                            ...modes,
-                            [m.id]: e.target.value as "append" | "replace",
-                          }))
-                        }
-                      >
-                        <option value="append">追加到数组字段 / 默认追加</option>
-                        <option value="replace">替换该字段现有内容</option>
-                      </select>
-                    </label>
-                    <div className="qa-button-row">
-                      <button
-                        type="button"
-                        disabled={isInteractionLocked || writebackStatus[m.id] === "running"}
-                        onClick={() => void applyQaAnswer(m)}
-                      >
-                        {writebackStatus[m.id] === "running" ? "回写中..." : "认可并回写"}
-                      </button>
-                      {editingMessageId === m.id ? (
-                        <>
-                          <button
-                            type="button"
-                            disabled={
-                              isInteractionLocked ||
-                              writebackStatus[m.id] === "running" ||
-                              !editingAnswer.trim()
-                            }
-                            onClick={() => void applyQaAnswer(m, editingAnswer.trim())}
-                          >
-                            保存回写
-                          </button>
-                          <button
-                            type="button"
-                            disabled={writebackStatus[m.id] === "running"}
-                            onClick={() => {
-                              setEditingMessageId(null);
-                              setEditingAnswer("");
-                            }}
-                          >
-                            取消
-                          </button>
-                        </>
-                      ) : (
-                        <button
-                          type="button"
-                          disabled={isInteractionLocked || writebackStatus[m.id] === "running"}
-                          onClick={() => {
-                            setEditingMessageId(m.id);
-                            setEditingAnswer(m.text);
-                          }}
-                        >
-                          编辑后回写
-                        </button>
-                      )}
-                    </div>
-                    {writebackStatus[m.id] === "success" && (
-                      <small className="writeback-hint success">已回写并刷新结构化草稿。</small>
-                    )}
-                    {writebackStatus[m.id] === "error" && (
-                      <small className="writeback-hint error">
-                        回写失败或缺少目标字段，请选择字段后重试。
-                      </small>
-                    )}
-                  </div>
-                )}
+              <div className="empty-state compact conversation-empty">
+                选择一个缺口、字段或原文证据后，Agent 会在这里生成追问、回答和可确认的补充内容。
               </div>
-              ))
             )}
           </div>
 
           {(activeFieldQuality || focusEvidenceBlocks.length > 0) && (
-            <div className="chat-context-strip">
-              {activeFieldQuality && (
-                <span>目标字段：{activeFieldQuality.label}</span>
-              )}
-              {focusContext.gapMessage && (
-                <span>缺口：{focusContext.gapMessage}</span>
-              )}
-              {focusRecommendedQuestion && (
-                <span>推荐追问：{focusRecommendedQuestion}</span>
-              )}
-              {focusEvidenceBlocks.map((block) => (
-                <button
-                  key={block.block_id}
-                  type="button"
-                  disabled={isInteractionLocked || isQuestionRefining}
-                  onClick={() => focusBlock(block.block_id)}
-                >
-                  {block.block_type}: {block.text_content.slice(0, 42)}
-                </button>
-              ))}
-            </div>
-          )}
-
-          {questionRefineProgress.status !== "idle" && (
             <section
-              className={`quality-inline-panel question-refine-panel ${questionRefineProgress.status}`}
+              className={`composer-context-card ${
+                contextStripExpanded ? "expanded" : "collapsed"
+              }`}
             >
-              <div className="quality-inline-header">
-                <span className="llm-pulse" />
-                <div>
-                  <strong>追问改写 Agent 正在生成问题草稿</strong>
-                  <p>
-                    {questionRefineProgress.message}
-                    {questionRefineProgress.elapsedMs > 0
-                      ? ` · ${Math.round(questionRefineProgress.elapsedMs / 1000)}s`
-                      : ""}
-                  </p>
+              <button
+                type="button"
+                className="composer-context-header"
+                onClick={() => setContextStripExpanded((v) => !v)}
+              >
+                <span>当前上下文</span>
+                <strong>
+                  {activeFieldQuality?.label ??
+                    (focusEvidenceBlocks.length
+                      ? `${focusEvidenceBlocks.length} 个证据 block`
+                      : "已选择上下文")}
+                </strong>
+                <small>{contextStripExpanded ? "收起" : "展开"}</small>
+              </button>
+              {contextStripExpanded && (
+                <div className="chat-context-strip">
+                  {activeFieldQuality && (
+                    <span>目标字段：{activeFieldQuality.label}</span>
+                  )}
+                  {focusContext.gapMessage && (
+                    <span>缺口：{focusContext.gapMessage}</span>
+                  )}
+                  {focusRecommendedQuestion && (
+                    <span>推荐追问：{focusRecommendedQuestion}</span>
+                  )}
+                  {focusEvidenceBlocks.map((block) => (
+                    <button
+                      key={block.block_id}
+                      type="button"
+                      disabled={isInteractionLocked || isQuestionRefining}
+                      onClick={() => focusBlock(block.block_id)}
+                    >
+                      {block.block_type}: {block.text_content.slice(0, 42)}
+                    </button>
+                  ))}
                 </div>
-              </div>
-              <div className="llm-steps" aria-label="问题草稿生成过程">
-                {QUESTION_REFINE_STEPS.map((step, i) => (
-                  <span
-                    key={step}
-                    className={
-                      i < questionRefineProgress.stepIndex
-                        ? "done"
-                        : i === questionRefineProgress.stepIndex
-                          ? "active"
-                          : ""
-                    }
-                  >
-                    {step}
-                  </span>
-                ))}
-              </div>
-              <div className="llm-diagnostics">
-                {questionRefineProgress.contextSummary ??
-                  `证据 ${focusEvidenceBlocks.length} 个 block${
-                    activeFieldQuality ? ` · 目标字段：${activeFieldQuality.label}` : ""
-                  }`}
-              </div>
+              )}
             </section>
           )}
 
