@@ -38,6 +38,7 @@ afterEach(() => {
   vi.clearAllMocks();
   delete process.env.EBS_LLM_STRUCTURING;
   delete process.env.EBS_LLM_STRUCTURING_TIMEOUT_MS;
+  delete process.env.EBS_TRIAGE_INDEX_MAX_BLOCKS;
   delete process.env.DASHSCOPE_API_KEY;
   delete process.env.DASHSCOPE_MODEL;
 });
@@ -85,6 +86,67 @@ function sampleLargeIr(): DocumentIR {
       parent_block_id: null,
       children_block_ids: [],
     })),
+  };
+}
+
+function priorityFieldIr(): DocumentIR {
+  return {
+    doc_id: "doc-priority",
+    version_id: "v1",
+    blocks: [
+      {
+        block_id: "b-steps",
+        block_type: "paragraph",
+        text_content: "执行流程：先检查商品状态，再完成诊断动作。",
+        heading_level: 0,
+        source_file: "priority.md",
+        page_no: null,
+        sheet_name: null,
+        node_path: null,
+        attachment_refs: [],
+        parent_block_id: null,
+        children_block_ids: [],
+      },
+      {
+        block_id: "b-basis",
+        block_type: "paragraph",
+        text_content: "判断依据包含转化率、加购率、ROI、GMV 等核心指标。",
+        heading_level: 0,
+        source_file: "priority.md",
+        page_no: null,
+        sheet_name: null,
+        node_path: null,
+        attachment_refs: [],
+        parent_block_id: null,
+        children_block_ids: [],
+      },
+      {
+        block_id: "b-criteria",
+        block_type: "paragraph",
+        text_content: "判断标准需要明确正常、异常、通过条件和阈值。",
+        heading_level: 0,
+        source_file: "priority.md",
+        page_no: null,
+        sheet_name: null,
+        node_path: null,
+        attachment_refs: [],
+        parent_block_id: null,
+        children_block_ids: [],
+      },
+      {
+        block_id: "b-tools",
+        block_type: "paragraph",
+        text_content: "工具模板包括诊断表单、检查清单和记录表。",
+        heading_level: 0,
+        source_file: "priority.md",
+        page_no: null,
+        sheet_name: null,
+        node_path: null,
+        attachment_refs: [],
+        parent_block_id: null,
+        children_block_ids: [],
+      },
+    ],
   };
 }
 
@@ -336,13 +398,22 @@ describe("runGlobalQualityTriageWithLlmOrFallback", () => {
     const result = await runGlobalQualityTriageWithLlmOrFallback(sampleLargeIr());
 
     expect(result.triage_mode).toBe("llm");
-    expect(result.triage.recommended_tasks[0]?.title).toBe("补充判断标准");
+    expect(result.triage.recommended_tasks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ title: "补充判断标准" }),
+      ]),
+    );
     expect(result.diagnostics.attempts[0]).toEqual(
       expect.objectContaining({
         stage: "global_triage",
         label: "structuring.global_triage",
         status: "ok",
         user_prompt_chars: expect.any(Number),
+        system_prompt: expect.stringContaining("quality triage"),
+        user_prompt: expect.stringContaining("Compact document context"),
+        request_params: expect.objectContaining({
+          route: "triage",
+        }),
       }),
     );
     expect(mockedChatCompletionText).toHaveBeenCalledTimes(1);
@@ -418,6 +489,140 @@ describe("runGlobalQualityTriageWithLlmOrFallback", () => {
     expect(result.triage.recommended_tasks[0]?.priority).toBe("high");
     expect(result.triage.source_refs[0]?.block_id).toBe("b1");
   });
+
+  it("drops ungrounded LLM triage tasks that have no valid field or source block", async () => {
+    process.env.EBS_LLM_STRUCTURING = "1";
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText.mockResolvedValueOnce(
+      JSON.stringify({
+        summary: "发现两个任务。",
+        major_gaps: [],
+        recommended_tasks: [
+          {
+            title: "泛泛补充方法",
+            reason: "需要更多细节。",
+            question: "还有什么要补充？",
+            source_block_ids: ["missing-block"],
+            priority: "medium",
+          },
+          {
+            title: "补充判断标准",
+            reason: "缺少判断口径。",
+            question: "判断标准是什么？",
+            target_field: "judgment_criteria",
+            source_block_ids: ["b1", "missing-block"],
+            priority: "high",
+          },
+        ],
+        suggested_questions: [
+          {
+            question: "泛泛问题？",
+            source_block_ids: ["missing-block"],
+          },
+        ],
+        source_refs: ["missing-block", "b1"],
+      }),
+    );
+
+    const result = await runGlobalQualityTriageWithLlmOrFallback(sampleIr());
+
+    expect(result.triage.recommended_tasks).toHaveLength(3);
+    expect(result.triage.recommended_tasks).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ title: "泛泛补充方法" }),
+      ]),
+    );
+    expect(result.triage.recommended_tasks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          title: "补充判断标准",
+          target_field: "judgment_criteria",
+          source_block_ids: ["b1"],
+        }),
+      ]),
+    );
+    expect(result.triage.suggested_questions).toHaveLength(3);
+    expect(result.triage.source_refs).toEqual([{ block_id: "b1" }]);
+  });
+
+  it("prioritizes the four primary schema fields and returns at most three tasks", async () => {
+    process.env.EBS_LLM_STRUCTURING = "1";
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText.mockResolvedValueOnce(
+      JSON.stringify({
+        summary: "返回了过多任务。",
+        major_gaps: [],
+        recommended_tasks: [
+          {
+            title: "补充交付物",
+            reason: "交付物也不清楚。",
+            question: "输出什么？",
+            target_field: "deliverables",
+            source_block_ids: ["b-tools"],
+            priority: "high",
+          },
+          {
+            title: "补充工具模板",
+            reason: "工具模板不够具体。",
+            question: "用什么表单？",
+            target_field: "tool_templates",
+            source_block_ids: ["b-tools"],
+            priority: "high",
+          },
+          {
+            title: "补充判断标准",
+            reason: "标准不够明确。",
+            question: "怎么判定正常异常？",
+            target_field: "judgment_criteria",
+            source_block_ids: ["b-criteria"],
+            priority: "low",
+          },
+          {
+            title: "补充指标依据",
+            reason: "缺少指标。",
+            question: "看哪些指标？",
+            source_block_ids: ["b-basis"],
+            priority: "medium",
+          },
+          {
+            title: "补充执行步骤",
+            reason: "步骤缺少细节。",
+            question: "具体怎么执行？",
+            target_field: "execution_steps",
+            source_block_ids: ["b-steps"],
+            priority: "low",
+          },
+        ],
+        suggested_questions: [],
+        source_refs: ["b-steps", "b-basis", "b-criteria", "b-tools"],
+      }),
+    );
+
+    const result = await runGlobalQualityTriageWithLlmOrFallback(priorityFieldIr());
+
+    expect(result.triage.recommended_tasks).toHaveLength(3);
+    expect(result.triage.recommended_tasks.map((task) => task.target_field)).toEqual([
+      "execution_steps",
+      "judgment_basis",
+      "judgment_criteria",
+    ]);
+    expect(result.triage.recommended_tasks[1]?.source_block_ids).toEqual([
+      "b-basis",
+    ]);
+  });
+
+  it("keeps heuristic fallback focused on at most three priority fields", async () => {
+    const result = await runGlobalQualityTriageWithLlmOrFallback(sampleIr("普通说明"));
+
+    expect(result.triage_mode).toBe("rules");
+    expect(result.triage.recommended_tasks).toHaveLength(3);
+    expect(result.triage.recommended_tasks.map((task) => task.target_field)).toEqual([
+      "execution_steps",
+      "judgment_basis",
+      "judgment_criteria",
+    ]);
+    expect(result.triage.suggested_questions).toHaveLength(3);
+  });
 });
 
 describe("buildCompactDocumentContext", () => {
@@ -452,11 +657,43 @@ describe("buildGlobalQualityTriagePromptInput", () => {
     const input = buildGlobalQualityTriagePromptInput(sampleLargeIr());
 
     expect(input.context.selectedBlockCount).toBeLessThanOrEqual(4);
-    expect(input.prompt.length).toBeLessThan(1600);
+    expect(input.prompt.length).toBeLessThan(3200);
     expect(input.prompt).toContain("b1");
+    expect(input.prompt).toContain("Document navigation index");
+    expect(input.prompt).toContain("b12");
     expect(input.prompt).toContain("recommended_tasks");
     expect(input.prompt).not.toContain("BusinessDocStructuredDraft");
     expect(input.prompt).not.toContain("GroundTruthDraft");
+  });
+
+  it("caps the navigation index for very large documents", () => {
+    process.env.EBS_TRIAGE_INDEX_MAX_BLOCKS = "500";
+    const largeIr: DocumentIR = {
+      doc_id: "doc-huge",
+      version_id: "v1",
+      blocks: Array.from({ length: 500 }, (_, index) => ({
+        block_id: `huge-${index + 1}`,
+        block_type: index % 12 === 0 ? "heading" : "paragraph",
+        text_content: `第 ${index + 1} 段：商品诊断流程内容。`,
+        heading_level: index % 12 === 0 ? 2 : 0,
+        source_file: "huge.md",
+        source_span: `L${index + 1}`,
+        page_no: null,
+        sheet_name: null,
+        node_path: null,
+        attachment_refs: [],
+        parent_block_id: null,
+        children_block_ids: [],
+      })),
+    };
+
+    const input = buildGlobalQualityTriagePromptInput(largeIr);
+
+    expect(input.prompt).toContain("total_blocks=500");
+    expect(input.prompt).toContain("indexed_blocks=240");
+    expect(input.prompt).toContain("omitted_blocks=260");
+    expect(input.prompt).not.toContain("huge-500");
+    expect(input.prompt.length).toBeLessThan(22000);
   });
 });
 

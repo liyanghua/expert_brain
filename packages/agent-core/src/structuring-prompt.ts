@@ -252,6 +252,27 @@ ${JSON.stringify(blocks, null, 2)}`;
   };
 }
 
+export function buildDocumentNavigationIndex(ir: DocumentIR): string {
+  const maxIndexBlocks = Math.min(
+    positiveInt(process.env.EBS_TRIAGE_INDEX_MAX_BLOCKS, 160),
+    240,
+  );
+  const indexedBlocks = ir.blocks.slice(0, maxIndexBlocks);
+  const lines = indexedBlocks.map((block, index) => {
+    const level = block.heading_level ? ` h${block.heading_level}` : "";
+    const span = block.source_span ? ` ${block.source_span}` : "";
+    const parent = block.parent_block_id ? ` parent=${block.parent_block_id}` : "";
+    const text = compactBlockText(block.text_content.replace(/\s+/g, " "), 60);
+    return `${index + 1}. ${block.block_id} ${block.block_type}${level}${span}${parent}: ${text}`;
+  });
+  const omitted = Math.max(0, ir.blocks.length - indexedBlocks.length);
+  return `Document navigation index (all blocks, compact):
+total_blocks=${ir.blocks.length}
+indexed_blocks=${indexedBlocks.length}
+omitted_blocks=${omitted}
+${lines.join("\n")}`;
+}
+
 export function buildKnowledgeSkeletonPromptInput(ir: DocumentIR): {
   prompt: string;
   context: CompactDocumentContext;
@@ -296,12 +317,16 @@ export function buildGlobalQualityTriagePromptInput(ir: DocumentIR): {
     maxOutlineItems: 4,
     maxOutlineChars: 32,
   });
+  const navigationIndex = buildDocumentNavigationIndex(ir);
   return {
     prompt: `doc_id: ${ir.doc_id}
 version_id: ${ir.version_id}
 
-Goal: find top 2 quality gaps and local expert questions. Do not map all fields. Return at most 2 major_gaps, 2 recommended_tasks, 2 suggested_questions. Keep each message/reason/question concise.
+Goal: find at most 3 key tasks for the user. Prefer these fields in order: execution_steps, judgment_basis, judgment_criteria, tool_templates. Use the navigation index to scan the whole document structure, then use selected key blocks for detail. Do not map all fields. Return at most 3 major_gaps, 3 recommended_tasks, 3 suggested_questions. Keep each message/reason/question concise.
 JSON keys: summary, major_gaps[{field_key,severity,message,source_refs[{block_id}]}], recommended_tasks[{title,reason,question,target_field,source_block_ids,priority}], suggested_questions[{question,target_field,source_block_ids}], source_refs[{block_id}].
+Every recommended task must include target_field or at least one valid source_block_id from the navigation index.
+
+${navigationIndex}
 
 Compact document context:
 ${context.text}`,

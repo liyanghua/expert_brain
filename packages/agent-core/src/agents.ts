@@ -17,7 +17,11 @@ import {
   type StructuredFieldKey,
   type SourceRef,
 } from "@ebs/ground-truth-schema";
-import { chatCompletionText, resolveLlmRequestConfig } from "./llm-client.js";
+import {
+  chatCompletionText,
+  resolveLlmRequestConfig,
+  type LlmProvider,
+} from "./llm-client.js";
 
 function blockRefs(blocks: DocumentBlock[]): SourceRef[] {
   return blocks.map((b) => ({
@@ -312,7 +316,80 @@ function classifyAgentLlmError(err: unknown): {
   if (/LLM HTTP/i.test(message)) {
     return { reason: "http_error", message };
   }
+  if (/empty message content/i.test(message)) {
+    return { reason: "empty_response", message };
+  }
   return { reason: "unknown_error", message };
+}
+
+function hasDashScopeFallbackConfig(): boolean {
+  return Boolean(process.env.DASHSCOPE_API_KEY && process.env.DASHSCOPE_MODEL);
+}
+
+function isQaFallbackRetryable(reason: string, message: string) {
+  return (
+    reason === "timeout" ||
+    reason === "http_error" ||
+    reason === "empty_response" ||
+    /fetch failed|ECONNRESET|socket hang up|network/i.test(message)
+  );
+}
+
+async function chatCompletionTextWithQaFallback(opts: {
+  system: string;
+  user: string;
+  timeoutMs: number;
+  label: "qa.answer";
+}): Promise<{
+  raw: string;
+  label: string;
+  provider?: LlmProvider;
+  timeoutMs: number;
+  startedAt: number;
+}> {
+  const startedAt = Date.now();
+  try {
+    const raw = await chatCompletionText({
+      system: opts.system,
+      user: opts.user,
+      timeoutMs: opts.timeoutMs,
+      label: opts.label,
+    });
+    return {
+      raw,
+      label: opts.label,
+      timeoutMs: opts.timeoutMs,
+      startedAt,
+    };
+  } catch (err) {
+    const { reason, message } = classifyAgentLlmError(err);
+    if (!hasDashScopeFallbackConfig() || !isQaFallbackRetryable(reason, message)) {
+      throw err;
+    }
+    const fallbackLabel = `${opts.label}.fallback_dashscope`;
+    console.info("[EBS LLM fallback]", {
+      from: opts.label,
+      to: fallbackLabel,
+      provider: "dashscope",
+      reason,
+      message,
+    });
+    const fallbackStartedAt = Date.now();
+    const raw = await chatCompletionText({
+      system: opts.system,
+      user: opts.user,
+      timeoutMs: opts.timeoutMs,
+      label: fallbackLabel,
+      provider: "dashscope",
+    });
+    return {
+      raw,
+      label: fallbackLabel,
+      provider: "dashscope",
+      timeoutMs: opts.timeoutMs,
+      startedAt: fallbackStartedAt,
+    };
+  }
 }
 
 function buildLlmCallDiagnostics(input: {
@@ -320,6 +397,7 @@ function buildLlmCallDiagnostics(input: {
   system: string;
   user: string;
   timeoutMs?: number;
+  provider?: LlmProvider;
   status?: "ok" | "failed" | "skipped";
   startedAt?: number;
   reason?: string;
@@ -328,14 +406,24 @@ function buildLlmCallDiagnostics(input: {
   const config = resolveLlmRequestConfig({
     label: input.label,
     timeoutMs: input.timeoutMs,
+    provider: input.provider,
   });
   return {
     label: input.label,
     provider: config.provider,
     model: config.model,
     timeout_ms: config.timeoutMs,
+    request_params: {
+      route: config.route,
+      timeout_ms: config.timeoutMs,
+      max_tokens: config.maxTokens,
+      response_json: config.responseJson,
+      temperature: Number(process.env.EBS_LLM_TEMPERATURE ?? 0.2),
+    },
     system_prompt_chars: input.system.length,
     user_prompt_chars: input.user.length,
+    system_prompt: input.system,
+    user_prompt: input.user,
     elapsed_ms:
       input.startedAt == null ? undefined : Date.now() - input.startedAt,
     status: input.status ?? "ok",
@@ -466,6 +554,7 @@ export async function runDocQAAsync(input: {
   blockId: string | null;
   evidenceBlockIds?: string[];
   question: string;
+  qaMode?: "direct_qa" | "task_refine_then_qa";
   questionSeed?: string | null;
   gapReason?: string | null;
   targetField?: string | null;
@@ -486,6 +575,7 @@ export async function runDocQAAsync(input: {
   if (process.env.EBS_LLM_QA?.trim() === "0") return fallback();
 
   const evidenceBlocks = evidenceBlocksForInput(input);
+  const qaMode = input.qaMode ?? "task_refine_then_qa";
   const related = relatedDraftForBlocks(
     input.draft,
     evidenceBlocks.map((block) => block.block_id),
@@ -494,7 +584,9 @@ export async function runDocQAAsync(input: {
 使用中文回答。回答必须精准、可追溯、可回写。
 结合专家画像：${JSON.stringify(input.expertMemory?.profile ?? {})}
 专家近期修正偏好：${JSON.stringify(input.expertMemory?.correction_summaries ?? [])}
-你需要先基于 recommended_question、evidence_blocks、target_field 和 gap_reason，在内部生成一个更具体的业务问题 refined_question，然后再回答。
+当 qa_mode 是 direct_qa 时，直接回答用户 question，不要把自由提问强制改写成任务追问；refined_question 可以省略或仅复述一个更清晰的问题。
+当 qa_mode 是 task_refine_then_qa 时，可以基于 recommended_question、evidence_blocks、target_field 和 gap_reason 生成更具体的 refined_question 后再回答。
+无论哪种模式，都要尽量输出可写入 Ground Truth 草稿的 suggested_writeback；只有证据确实不足时才返回 null。
 输出 JSON，字段：
 - refined_question: 你基于推荐追问和证据生成的具体业务问题
 - direct_answer: 直接答案
@@ -506,6 +598,7 @@ export async function runDocQAAsync(input: {
   const user = JSON.stringify(
     {
       question: input.question,
+      qa_mode: qaMode,
       recommended_question: input.questionSeed ?? input.question,
       target_field: input.targetField,
       gap_reason: input.gapReason,
@@ -519,35 +612,36 @@ export async function runDocQAAsync(input: {
   try {
     const label = "qa.answer";
     const config = resolveLlmRequestConfig({ label });
-    const startedAt = Date.now();
-    const raw = await chatCompletionText({
+    const completion = await chatCompletionTextWithQaFallback({
       system,
       user,
       timeoutMs: config.timeoutMs,
       label,
     });
-    const parsed = JSON.parse(raw.trim()) as unknown;
+    const parsed = JSON.parse(completion.raw.trim()) as unknown;
     const checked = QAResponseSchema.safeParse(parsed);
     if (checked.success) {
       return {
         ...checked.data,
         llm_diagnostics: buildLlmCallDiagnostics({
-          label,
+          label: completion.label,
           system,
           user,
-          timeoutMs: config.timeoutMs,
-          startedAt,
+          timeoutMs: completion.timeoutMs,
+          provider: completion.provider,
+          startedAt: completion.startedAt,
         }),
       };
     }
     return {
       ...fallback(),
       llm_diagnostics: buildLlmCallDiagnostics({
-        label,
+        label: completion.label,
         system,
         user,
-        timeoutMs: config.timeoutMs,
-        startedAt,
+        timeoutMs: completion.timeoutMs,
+        provider: completion.provider,
+        startedAt: completion.startedAt,
         status: "failed",
         reason: "schema_validation_error",
         message: "LLM response did not match QAResponseSchema",

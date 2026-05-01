@@ -49,8 +49,8 @@ function defaultProvider(): LlmProvider {
 
 function routeForLabel(label?: string): LlmRoute {
   if (label === "structuring.global_triage") return "triage";
-  if (label === "qa.refine_question") return "refine";
-  if (label === "qa.answer") return "qa";
+  if (label?.startsWith("qa.refine_question")) return "refine";
+  if (label?.startsWith("qa.answer")) return "qa";
   return "default";
 }
 

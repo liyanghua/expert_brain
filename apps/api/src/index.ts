@@ -4,7 +4,7 @@ import { extname, join } from "node:path";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { AgentOrchestrator } from "@ebs/agent-core";
+import { AgentOrchestrator, MAX_PRIMARY_TASKS } from "@ebs/agent-core";
 import type { DocumentIR } from "@ebs/document-ir";
 import {
   buildCandidateQuestionsFromScorecard,
@@ -37,6 +37,7 @@ import { processParseJobs } from "@ebs/job-runner";
 import { FileStore } from "@ebs/storage";
 
 import { loadKeyConfigMarkdown } from "./load-key-config.js";
+import { candidateInputForQa, draftForQaContext } from "./qa-helpers.js";
 
 const repoRoot = join(process.cwd(), "../..");
 loadKeyConfigMarkdown(repoRoot);
@@ -159,8 +160,8 @@ function mergeGlobalTriageIntoImprovementPlan(
   plan: ImprovementPlan,
   triage: GlobalQualityTriage,
 ): ImprovementPlan {
-  const candidateQuestions = [...plan.candidate_questions];
-  const seenQuestions = new Set(candidateQuestions.map((q) => q.question));
+  const triageQuestions: ImprovementPlan["candidate_questions"] = [];
+  const seenQuestions = new Set<string>();
   const addQuestion = (input: {
     question: string;
     target_field?: string;
@@ -168,7 +169,7 @@ function mergeGlobalTriageIntoImprovementPlan(
   }) => {
     if (seenQuestions.has(input.question)) return;
     seenQuestions.add(input.question);
-    candidateQuestions.push({
+    triageQuestions.push({
       metric: "global_quality_triage",
       metric_label: "全局质量诊断",
       question: input.question,
@@ -177,7 +178,9 @@ function mergeGlobalTriageIntoImprovementPlan(
     });
   };
 
-  for (const task of triage.recommended_tasks) {
+  const primaryTasks = triage.recommended_tasks.slice(0, MAX_PRIMARY_TASKS);
+  const primaryFields = new Set(primaryTasks.map((task) => task.target_field));
+  for (const task of primaryTasks) {
     addQuestion({
       question: task.question,
       target_field: task.target_field,
@@ -185,6 +188,8 @@ function mergeGlobalTriageIntoImprovementPlan(
     });
   }
   for (const question of triage.suggested_questions) {
+    if (triageQuestions.length >= MAX_PRIMARY_TASKS) break;
+    if (question.target_field && !primaryFields.has(question.target_field)) continue;
     addQuestion({
       question: question.question,
       target_field: question.target_field,
@@ -193,23 +198,26 @@ function mergeGlobalTriageIntoImprovementPlan(
   }
 
   const priority_actions =
-    triage.recommended_tasks.length > 0
+    primaryTasks.length > 0
       ? [
           {
             metric: "global_quality_triage",
             metric_display_name: "全局质量诊断",
             reason: triage.summary,
-            actions: triage.recommended_tasks.map((task) => task.question),
-            actions_display: triage.recommended_tasks.map((task) => task.title),
+            actions: primaryTasks.map((task) => task.question),
+            actions_display: primaryTasks.map((task) => task.title),
           },
-          ...plan.priority_actions,
-        ]
-      : plan.priority_actions;
+          ...plan.priority_actions.slice(0, Math.max(0, MAX_PRIMARY_TASKS - 1)),
+        ].slice(0, MAX_PRIMARY_TASKS)
+      : plan.priority_actions.slice(0, MAX_PRIMARY_TASKS);
 
   return {
     ...plan,
     priority_actions,
-    candidate_questions: candidateQuestions,
+    candidate_questions: [
+      ...triageQuestions,
+      ...plan.candidate_questions.filter((q) => !seenQuestions.has(q.question)),
+    ].slice(0, MAX_PRIMARY_TASKS),
   };
 }
 
@@ -315,6 +323,21 @@ function appendThreadStep(
   } catch {
     return null;
   }
+}
+
+function completeThread(
+  docId: string,
+  threadId: string | null | undefined,
+  payload: Record<string, unknown>,
+) {
+  const thread = appendThreadStep(docId, threadId, "task_completed", payload);
+  if (!thread) return null;
+  const completed = TaskThreadSchema.parse({
+    ...thread,
+    status: "completed",
+  });
+  store.upsertTaskThread(docId, completed);
+  return completed;
 }
 
 function candidateText(candidate: GTCandidate): string {
@@ -785,6 +808,10 @@ app.post("/documents/:docId/gt-candidates/:candidateId/confirm", async (c) => {
     candidate_id: candidateId,
     field_key: candidate.field_key,
   });
+  completeThread(docId, candidate.thread_id, {
+    candidate_id: candidateId,
+    field_key: candidate.field_key,
+  });
   const ir = tryReadIR(docId, meta.current_version_id);
   const scorecard = ir ? computeExtractionScorecard({ draft: nextDraft, ir }) : null;
   const improvement_plan =
@@ -834,12 +861,11 @@ app.post("/documents/:docId/qa/refine-question", async (c) => {
   if (!ir) {
     return c.json(irNotReadyPayload(docId, meta.current_version_id), 409);
   }
-  let draft = await safeDraft(docId, meta.current_version_id);
-  if (!draft) {
-    const r = await orchestrator.runA1StructuringAsync(ir);
-    draft = r.draft;
-    store.writeDraft(docId, meta.current_version_id, draft);
-  }
+  const draft = await draftForQaContext({
+    docId,
+    versionId: meta.current_version_id,
+    readDraft: () => safeDraft(docId, meta.current_version_id),
+  });
   const targetField =
     typeof body.target_field === "string" ? body.target_field : null;
   const evidenceBlockIds = evidenceBlockIdsFromBody(body, ir);
@@ -881,12 +907,11 @@ app.post("/documents/:docId/qa", async (c) => {
   if (!ir) {
     return c.json(irNotReadyPayload(docId, meta.current_version_id), 409);
   }
-  let draft = await safeDraft(docId, meta.current_version_id);
-  if (!draft) {
-    const r = await orchestrator.runA1StructuringAsync(ir);
-    draft = r.draft;
-    store.writeDraft(docId, meta.current_version_id, draft);
-  }
+  const draft = await draftForQaContext({
+    docId,
+    versionId: meta.current_version_id,
+    readDraft: () => safeDraft(docId, meta.current_version_id),
+  });
   const targetField =
     typeof body.target_field === "string" ? body.target_field : null;
   const evidenceBlockIds = evidenceBlockIdsFromBody(body, ir);
@@ -898,6 +923,10 @@ app.post("/documents/:docId/qa", async (c) => {
     blockId,
     evidenceBlockIds,
     question: typeof body.question === "string" ? body.question : "",
+    qaMode:
+      body.qa_mode === "direct_qa" || body.qa_mode === "task_refine_then_qa"
+        ? body.qa_mode
+        : undefined,
     questionSeed:
       typeof body.question_seed === "string" ? body.question_seed : null,
     gapReason: typeof body.gap_reason === "string" ? body.gap_reason : null,
@@ -923,29 +952,45 @@ app.post("/documents/:docId/qa", async (c) => {
     target_field: qa.target_field,
   });
   let gtCandidate: GTCandidate | null = null;
-  const candidateField = qa.suggested_writeback?.field_key ?? qa.target_field;
-  if (candidateField && isStructuredFieldKey(candidateField)) {
-    const now = isoNow();
-    gtCandidate = GTCandidateSchema.parse({
-      candidate_id: randomUUID(),
-      thread_id: thread.thread_id,
-      doc_id: docId,
-      version_id: meta.current_version_id,
-      field_key: candidateField,
-      content: qa.suggested_writeback?.content ?? { text: qa.direct_answer },
-      source_refs: qa.source_block_refs.map((blockId) => ({ block_id: blockId })),
-      status: "draft",
-      recommended_mode: "append",
-      created_from_step_id: null,
-      rationale: qa.rationale,
-      created_at: now,
-      updated_at: now,
-    });
+  let qaDiagnostics = qa.llm_diagnostics;
+  const candidateInput = candidateInputForQa({
+    requestedTargetField: targetField,
+    qa,
+    evidenceBlockIds,
+    question: typeof body.question === "string" ? body.question : "",
+  });
+  const now = isoNow();
+  const candidateResult = GTCandidateSchema.safeParse({
+    candidate_id: randomUUID(),
+    thread_id: thread.thread_id,
+    doc_id: docId,
+    version_id: meta.current_version_id,
+    field_key: candidateInput.fieldKey,
+    content: candidateInput.content,
+    source_refs: candidateInput.sourceBlockIds.map((blockId) => ({ block_id: blockId })),
+    status: "draft",
+    recommended_mode: "append",
+    created_from_step_id: null,
+    rationale: qa.rationale,
+    created_at: now,
+    updated_at: now,
+  });
+  if (candidateResult.success) {
+    gtCandidate = candidateResult.data;
     store.upsertGTCandidate(docId, gtCandidate);
     appendThreadStep(docId, thread.thread_id, "gt_candidate_created", {
       candidate_id: gtCandidate.candidate_id,
       field_key: gtCandidate.field_key,
     });
+  } else {
+    qaDiagnostics = qaDiagnostics
+      ? {
+          ...qaDiagnostics,
+          status: "failed",
+          reason: "candidate_validation_error",
+          message: candidateResult.error.message,
+        }
+      : undefined;
   }
   const memory = store.readExpertMemory(docId);
   store.writeExpertMemory(docId, {
@@ -955,7 +1000,12 @@ app.post("/documents/:docId/qa", async (c) => {
       ...memory.recent_questions,
     ].filter(Boolean).slice(0, 20),
   });
-  return c.json({ ...qa, thread_id: thread.thread_id, gt_candidate: gtCandidate });
+  return c.json({
+    ...qa,
+    llm_diagnostics: qaDiagnostics,
+    thread_id: thread.thread_id,
+    gt_candidate: gtCandidate,
+  });
 });
 
 app.post("/documents/:docId/qa/apply", async (c) => {
@@ -1021,6 +1071,10 @@ app.post("/documents/:docId/qa/apply", async (c) => {
     field_key: fieldKey,
     answer_text: answerText.trim(),
     mode: body.mode === "replace" ? "replace" : "append",
+  });
+  completeThread(docId, threadId, {
+    field_key: fieldKey,
+    answer_text: answerText.trim(),
   });
   return c.json({
     draft: next,

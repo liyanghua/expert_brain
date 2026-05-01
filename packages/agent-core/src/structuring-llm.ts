@@ -2,10 +2,13 @@ import type { DocumentIR } from "@ebs/document-ir";
 import {
   GroundTruthDraftSchema,
   GlobalQualityTriageSchema,
+  MAX_PRIMARY_TASKS,
+  PRIMARY_TASK_FIELD_PROFILES,
   STRUCTURED_FIELD_KEYS,
   emptyGroundTruthDraft,
   type GlobalQualityTriage,
   type GroundTruthDraft,
+  type PrimaryTaskFieldKey,
   type StructuredFieldKey,
 } from "@ebs/ground-truth-schema";
 import { runStructuring } from "./agents.js";
@@ -45,8 +48,11 @@ export type StructuringDiagnostics = {
     provider?: string;
     model?: string;
     timeout_ms?: number;
+    request_params?: Record<string, unknown>;
     system_prompt_chars?: number;
     user_prompt_chars?: number;
+    system_prompt?: string;
+    user_prompt?: string;
     elapsed_ms?: number;
   }[];
   llm_failure_reason?: StructuringFailureReason;
@@ -118,6 +124,18 @@ const OBJECT_STRUCTURED_FIELD_KEY_SET = new Set<string>([
   "scenario_goal",
   "process_flow_or_business_model",
 ]);
+const STRUCTURED_FIELD_KEY_SET = new Set<string>(STRUCTURED_FIELD_KEYS);
+const PRIMARY_TASK_FIELD_KEY_SET = new Set<string>(
+  PRIMARY_TASK_FIELD_PROFILES.map((profile) => profile.field_key),
+);
+const PRIMARY_TASK_FIELD_RANK = new Map<string, number>(
+  PRIMARY_TASK_FIELD_PROFILES.map((profile, index) => [profile.field_key, index]),
+);
+const PRIORITY_RANK: Record<"low" | "medium" | "high", number> = {
+  high: 0,
+  medium: 1,
+  low: 2,
+};
 
 export function normalizeLlmStructuredFields(
   partial: Record<string, unknown>,
@@ -230,6 +248,226 @@ function normalizeGlobalQualityTriagePayload(value: unknown): unknown {
       : [],
     source_refs: normalizeTriageSourceRefs(input.source_refs),
   };
+}
+
+function groundedGlobalQualityTriage(
+  value: GlobalQualityTriage,
+  ir: DocumentIR,
+): GlobalQualityTriage {
+  const validBlockIds = new Set(ir.blocks.map((block) => block.block_id));
+  const filterBlockIds = (ids: string[] | undefined) =>
+    (ids ?? []).filter((blockId) => validBlockIds.has(blockId));
+  const filterSourceRefs = (refs: GlobalQualityTriage["source_refs"]) =>
+    refs.filter((ref) => ref.block_id && validBlockIds.has(ref.block_id));
+  const normalizeField = (field: string | undefined) =>
+    field && STRUCTURED_FIELD_KEY_SET.has(field) ? field : undefined;
+
+  const major_gaps = value.major_gaps
+    .map((gap) => ({
+      ...gap,
+      field_key: normalizeField(gap.field_key),
+      source_refs: filterSourceRefs(gap.source_refs),
+    }))
+    .filter((gap) => gap.field_key || gap.source_refs.length > 0);
+
+  const recommended_tasks = value.recommended_tasks
+    .map((task) => ({
+      ...task,
+      target_field: normalizeField(task.target_field),
+      source_block_ids: filterBlockIds(task.source_block_ids),
+    }))
+    .filter((task) => task.target_field || task.source_block_ids.length > 0);
+
+  const suggested_questions = value.suggested_questions
+    .map((question) => ({
+      ...question,
+      target_field: normalizeField(question.target_field),
+      source_block_ids: filterBlockIds(question.source_block_ids),
+    }))
+    .filter((question) => question.target_field || question.source_block_ids.length > 0);
+
+  return GlobalQualityTriageSchema.parse({
+    ...value,
+    major_gaps,
+    recommended_tasks,
+    suggested_questions,
+    source_refs: filterSourceRefs(value.source_refs),
+  });
+}
+
+function keywordHitCount(text: string, keywords: readonly string[]): number {
+  const lower = text.toLowerCase();
+  return keywords.reduce((count, keyword) => {
+    return lower.includes(keyword.toLowerCase()) ? count + 1 : count;
+  }, 0);
+}
+
+function primaryFieldBlockHits(ir: DocumentIR): Map<PrimaryTaskFieldKey, string[]> {
+  const hits = new Map<PrimaryTaskFieldKey, string[]>();
+  for (const profile of PRIMARY_TASK_FIELD_PROFILES) {
+    hits.set(profile.field_key, []);
+  }
+  for (const block of ir.blocks) {
+    for (const profile of PRIMARY_TASK_FIELD_PROFILES) {
+      if (keywordHitCount(block.text_content, profile.keywords) > 0) {
+        hits.get(profile.field_key)?.push(block.block_id);
+      }
+    }
+  }
+  return hits;
+}
+
+function normalizePrimaryTaskField(field: string | undefined): PrimaryTaskFieldKey | undefined {
+  return field && PRIMARY_TASK_FIELD_KEY_SET.has(field)
+    ? (field as PrimaryTaskFieldKey)
+    : undefined;
+}
+
+function inferPrimaryTaskFieldFromBlocks(
+  ir: DocumentIR,
+  sourceBlockIds: string[],
+): PrimaryTaskFieldKey | undefined {
+  let bestField: PrimaryTaskFieldKey | undefined;
+  let bestScore = 0;
+  for (const profile of PRIMARY_TASK_FIELD_PROFILES) {
+    const score = sourceBlockIds.reduce((total, blockId) => {
+      const block = ir.blocks.find((item) => item.block_id === blockId);
+      return block
+        ? total + keywordHitCount(block.text_content, profile.keywords)
+        : total;
+    }, 0);
+    const rank = PRIMARY_TASK_FIELD_RANK.get(profile.field_key) ?? Number.MAX_SAFE_INTEGER;
+    const bestRank = bestField
+      ? (PRIMARY_TASK_FIELD_RANK.get(bestField) ?? Number.MAX_SAFE_INTEGER)
+      : Number.MAX_SAFE_INTEGER;
+    if (score > bestScore || (score === bestScore && score > 0 && rank < bestRank)) {
+      bestScore = score;
+      bestField = profile.field_key;
+    }
+  }
+  return bestScore > 0 ? bestField : undefined;
+}
+
+function taskSortKey(task: GlobalQualityTriage["recommended_tasks"][number]) {
+  return [
+    PRIMARY_TASK_FIELD_RANK.get(task.target_field ?? "") ?? Number.MAX_SAFE_INTEGER,
+    PRIORITY_RANK[task.priority],
+  ] as const;
+}
+
+function betterPrimaryTask(
+  current: GlobalQualityTriage["recommended_tasks"][number] | undefined,
+  next: GlobalQualityTriage["recommended_tasks"][number],
+) {
+  if (!current) return next;
+  const currentKey = taskSortKey(current);
+  const nextKey = taskSortKey(next);
+  if (nextKey[1] !== currentKey[1]) {
+    return nextKey[1] < currentKey[1] ? next : current;
+  }
+  return next.source_block_ids.length > current.source_block_ids.length ? next : current;
+}
+
+function prioritizeGlobalQualityTasks(
+  value: GlobalQualityTriage,
+  ir: DocumentIR,
+): GlobalQualityTriage {
+  const fieldBlockHits = primaryFieldBlockHits(ir);
+  const taskByField = new Map<
+    PrimaryTaskFieldKey,
+    GlobalQualityTriage["recommended_tasks"][number]
+  >();
+
+  for (const task of value.recommended_tasks) {
+    const source_block_ids = task.source_block_ids.filter((blockId) =>
+      ir.blocks.some((block) => block.block_id === blockId),
+    );
+    const target_field =
+      normalizePrimaryTaskField(task.target_field) ??
+      inferPrimaryTaskFieldFromBlocks(ir, source_block_ids);
+    if (!target_field) continue;
+    taskByField.set(
+      target_field,
+      betterPrimaryTask(taskByField.get(target_field), {
+        ...task,
+        target_field,
+        source_block_ids,
+      }),
+    );
+  }
+
+  for (const profile of PRIMARY_TASK_FIELD_PROFILES) {
+    if (taskByField.has(profile.field_key)) continue;
+    const sourceBlockIds = fieldBlockHits.get(profile.field_key) ?? [];
+    if (sourceBlockIds.length > 0) continue;
+    taskByField.set(profile.field_key, {
+      title: profile.missing_title,
+      reason: profile.missing_reason,
+      question: profile.missing_question,
+      target_field: profile.field_key,
+      source_block_ids: [],
+      priority: "high",
+    });
+  }
+
+  const recommended_tasks = [...taskByField.values()]
+    .sort((a, b) => {
+      const aKey = taskSortKey(a);
+      const bKey = taskSortKey(b);
+      return aKey[0] - bKey[0] || aKey[1] - bKey[1];
+    })
+    .slice(0, MAX_PRIMARY_TASKS);
+  const selectedFields = new Set(recommended_tasks.map((task) => task.target_field));
+  const suggestedByField = new Map<
+    string,
+    GlobalQualityTriage["suggested_questions"][number]
+  >();
+
+  for (const question of value.suggested_questions) {
+    const source_block_ids = question.source_block_ids.filter((blockId) =>
+      ir.blocks.some((block) => block.block_id === blockId),
+    );
+    const target_field =
+      normalizePrimaryTaskField(question.target_field) ??
+      inferPrimaryTaskFieldFromBlocks(ir, source_block_ids);
+    if (!target_field || !selectedFields.has(target_field)) continue;
+    if (!suggestedByField.has(target_field)) {
+      suggestedByField.set(target_field, {
+        ...question,
+        target_field,
+        source_block_ids,
+      });
+    }
+  }
+
+  const suggested_questions = recommended_tasks.map((task) => {
+    return (
+      suggestedByField.get(task.target_field ?? "") ?? {
+        question: task.question,
+        target_field: task.target_field,
+        source_block_ids: task.source_block_ids,
+      }
+    );
+  });
+
+  const major_gaps = value.major_gaps
+    .map((gap) => {
+      const sourceBlockIds = gap.source_refs
+        .map((ref) => ref.block_id)
+        .filter((blockId): blockId is string => Boolean(blockId));
+      const field_key =
+        normalizePrimaryTaskField(gap.field_key) ??
+        inferPrimaryTaskFieldFromBlocks(ir, sourceBlockIds);
+      return { ...gap, field_key };
+    })
+    .filter((gap) => !gap.field_key || selectedFields.has(gap.field_key));
+
+  return GlobalQualityTriageSchema.parse({
+    ...value,
+    major_gaps,
+    recommended_tasks,
+    suggested_questions,
+  });
 }
 
 function mergeDraftFromLlm(
@@ -416,11 +654,11 @@ function fallbackResult(
 function sourceBlockIdsForTriage(ir: DocumentIR): string[] {
   return ir.blocks
     .filter((block) =>
-      /判断|标准|验证|输出|交付|触发|终止|输入|目标|流程|执行|问题|解决/.test(
-        block.text_content,
+      PRIMARY_TASK_FIELD_PROFILES.some(
+        (profile) => keywordHitCount(block.text_content, profile.keywords) > 0,
       ),
     )
-    .slice(0, 4)
+    .slice(0, MAX_PRIMARY_TASKS)
     .map((block) => block.block_id);
 }
 
@@ -432,7 +670,7 @@ function heuristicGlobalQualityTriage(ir: DocumentIR): GlobalQualityTriage {
   const recommended_tasks: GlobalQualityTriage["recommended_tasks"] = [];
 
   const addGapTask = (input: {
-    field_key: string;
+    field_key: PrimaryTaskFieldKey;
     title: string;
     message: string;
     question: string;
@@ -454,48 +692,33 @@ function heuristicGlobalQualityTriage(ir: DocumentIR): GlobalQualityTriage {
     });
   };
 
-  if (!/判断标准|标准|阈值|通过|异常|正常/.test(sourceText)) {
+  for (const profile of PRIMARY_TASK_FIELD_PROFILES) {
+    if (recommended_tasks.length >= MAX_PRIMARY_TASKS) break;
+    if (keywordHitCount(sourceText, profile.keywords) > 0) continue;
     addGapTask({
-      field_key: "judgment_criteria",
-      title: "补充判断标准",
-      message: "当前文档缺少明确的判断口径或阈值。",
-      question: "这个流程里什么情况下判定为正常、异常或通过？",
+      field_key: profile.field_key,
+      title: profile.missing_title,
+      message: profile.missing_reason,
+      question: profile.missing_question,
       priority: "high",
     });
   }
-  if (!/验证|验收|复核|效果|检查/.test(sourceText)) {
-    addGapTask({
-      field_key: "validation_methods",
-      title: "补充验证方法",
-      message: "当前文档缺少执行完成后的验证方式。",
-      question: "执行完成后，应该如何验证结果有效？",
-      priority: "medium",
-    });
-  }
-  if (!/输出|交付|产出|结论|报告/.test(sourceText)) {
-    addGapTask({
-      field_key: "deliverables",
-      title: "明确输出成果",
-      message: "当前文档没有清楚说明流程结束后应产出什么。",
-      question: "完成这个流程后，需要交付哪些结论、动作或材料？",
-      priority: "medium",
-    });
-  }
   if (recommended_tasks.length === 0) {
+    const firstProfile = PRIMARY_TASK_FIELD_PROFILES[0];
     addGapTask({
-      field_key: "key_node_rationales",
-      title: "确认关键判断理由",
-      message: "文档已有主要内容，建议优先确认关键节点背后的业务理由。",
-      question: "这里最关键的判断节点是什么，为什么这样判断？",
+      field_key: firstProfile.field_key,
+      title: "确认执行步骤是否完整",
+      message: "文档已有基础内容，建议先确认关键操作步骤是否足够清楚。",
+      question: "当前内容里的关键执行步骤是否完整？还缺少哪些操作细节？",
       priority: "medium",
     });
   }
 
   return GlobalQualityTriageSchema.parse({
-    summary: "规则诊断发现文档仍需专家补充关键判断、验证或交付信息。",
+    summary: "规则诊断发现文档仍需专家补充关键执行步骤、判断依据或判断标准。",
     major_gaps,
-    recommended_tasks: recommended_tasks.slice(0, 4),
-    suggested_questions: recommended_tasks.slice(0, 4).map((task) => ({
+    recommended_tasks: recommended_tasks.slice(0, MAX_PRIMARY_TASKS),
+    suggested_questions: recommended_tasks.slice(0, MAX_PRIMARY_TASKS).map((task) => ({
       question: task.question,
       target_field: task.target_field,
       source_block_ids: task.source_block_ids,
@@ -543,8 +766,17 @@ export async function runGlobalQualityTriageWithLlmOrFallback(
     provider: config.provider,
     model: config.model,
     timeout_ms: config.timeoutMs,
+    request_params: {
+      route: config.route,
+      timeout_ms: config.timeoutMs,
+      max_tokens: config.maxTokens,
+      response_json: config.responseJson,
+      temperature: Number(process.env.EBS_LLM_TEMPERATURE ?? 0.2),
+    },
     system_prompt_chars: system.length,
     user_prompt_chars: input.prompt.length,
+    system_prompt: system,
+    user_prompt: input.prompt,
   };
   const startedAt = Date.now();
   try {
@@ -555,8 +787,14 @@ export async function runGlobalQualityTriageWithLlmOrFallback(
       label,
       promptDiagnostics: promptDiagnostics("global_triage", input.context),
     });
-    const parsed = GlobalQualityTriageSchema.parse(
-      normalizeGlobalQualityTriagePayload(extractJsonObject(raw)),
+    const parsed = prioritizeGlobalQualityTasks(
+      groundedGlobalQualityTriage(
+        GlobalQualityTriageSchema.parse(
+          normalizeGlobalQualityTriagePayload(extractJsonObject(raw)),
+        ),
+        ir,
+      ),
+      ir,
     );
     diagnostics.attempts.push({
       ...attemptBase,

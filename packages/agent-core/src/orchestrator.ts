@@ -70,6 +70,7 @@ export class AgentOrchestrator {
     blockId: string | null;
     evidenceBlockIds?: string[];
     question: string;
+    qaMode?: "direct_qa" | "task_refine_then_qa";
     questionSeed?: string | null;
     gapReason?: string | null;
     targetField?: string | null;

@@ -205,6 +205,53 @@ export const GROUND_TRUTH_FIELD_KEYS = STRUCTURED_FIELD_KEYS;
 export type StructuredFieldKey = (typeof STRUCTURED_FIELD_KEYS)[number];
 export type GroundTruthFieldKey = StructuredFieldKey;
 
+export const MAX_PRIMARY_TASKS = 3;
+
+export const PRIMARY_TASK_FIELD_PROFILES = [
+  {
+    field_key: "execution_steps",
+    label: "执行步骤",
+    keywords: ["步骤", "流程", "动作", "执行", "操作", "SOP", "怎么做"],
+    missing_title: "补充执行步骤",
+    missing_reason: "文档还没有清楚说明具体怎么操作，建议先补齐关键步骤。",
+    missing_question: "这个任务从开始到完成，具体应该按哪些步骤执行？",
+  },
+  {
+    field_key: "judgment_basis",
+    label: "判断依据",
+    keywords: ["指标", "依据", "数据", "观察项", "转化率", "加购率", "ROI", "GMV"],
+    missing_title: "补充判断依据",
+    missing_reason: "文档还缺少做判断时要看的数据、指标或观察项。",
+    missing_question: "做这个判断时，需要重点查看哪些数据、指标或观察项？",
+  },
+  {
+    field_key: "judgment_criteria",
+    label: "判断标准",
+    keywords: ["标准", "阈值", "正常", "异常", "通过", "判定口径"],
+    missing_title: "补充判断标准",
+    missing_reason: "文档还没有把正常、异常或通过的判定口径讲清楚。",
+    missing_question: "什么情况下判定为正常、异常或通过？有没有明确阈值？",
+  },
+  {
+    field_key: "tool_templates",
+    label: "工具表单模板",
+    keywords: ["模板", "表单", "清单", "工具", "记录表", "截图", "看板"],
+    missing_title: "补充工具表单",
+    missing_reason: "文档还缺少执行时可直接使用的表单、清单或工具模板。",
+    missing_question: "执行这个任务时，需要使用哪些表单、清单、截图或看板？",
+  },
+] as const satisfies readonly {
+  field_key: StructuredFieldKey;
+  label: string;
+  keywords: readonly string[];
+  missing_title: string;
+  missing_reason: string;
+  missing_question: string;
+}[];
+
+export type PrimaryTaskFieldKey =
+  (typeof PRIMARY_TASK_FIELD_PROFILES)[number]["field_key"];
+
 export const FIELD_DEFINITIONS_ZH = {
   business_scenario: {
     label: "业务场景",
@@ -445,8 +492,11 @@ export const LlmCallDiagnosticsSchema = z.object({
   provider: z.string(),
   model: z.string(),
   timeout_ms: z.number(),
+  request_params: z.record(z.unknown()).optional(),
   system_prompt_chars: z.number(),
   user_prompt_chars: z.number(),
+  system_prompt: z.string().optional(),
+  user_prompt: z.string().optional(),
   elapsed_ms: z.number().optional(),
   status: z.enum(["ok", "failed", "skipped"]).default("ok"),
   reason: z.string().optional(),
@@ -468,6 +518,7 @@ export const QAResponseSchema = z.object({
       field_key: z.string(),
       content: z.unknown(),
     })
+    .nullable()
     .optional(),
   llm_diagnostics: LlmCallDiagnosticsSchema.optional(),
 });
