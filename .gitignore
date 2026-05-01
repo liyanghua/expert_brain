@@ -2,6 +2,7 @@ node_modules
 dist
 .turbo
 *.log
+*.tsbuildinfo
 .DS_Store
 .env
 .env.local
@@ -10,5 +11,6 @@ key_config.md
 apps/web/playwright-report
 apps/web/test-results
 data/store
+biz_docs/
 coverage
 apps/docling-worker/.venv
