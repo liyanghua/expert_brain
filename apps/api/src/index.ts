@@ -4,7 +4,11 @@ import { extname, join } from "node:path";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { AgentOrchestrator, MAX_PRIMARY_TASKS } from "@ebs/agent-core";
+import {
+  AgentOrchestrator,
+  MAX_PRIMARY_TASKS,
+  deriveQualityIssueIndexFromTriage,
+} from "@ebs/agent-core";
 import type { DocumentIR } from "@ebs/document-ir";
 import {
   buildCandidateQuestionsFromScorecard,
@@ -20,6 +24,7 @@ import {
   ThreadStepSchema,
   ExpertNoteSchema,
   assertTransition,
+  emptyGroundTruthDraft,
 } from "@ebs/ground-truth-schema";
 import type {
   DocumentStatus,
@@ -27,6 +32,8 @@ import type {
   GlobalQualityTriage,
   GroundTruthDraft,
   GroundTruthFieldItem,
+  QualityIssueIndex,
+  SourceAnnotation,
   SourceRef,
   StructuredFieldKey,
   TaskThread,
@@ -97,6 +104,17 @@ function irNotReadyPayload(docId: string, versionId: string) {
     doc_id: docId,
     version_id: versionId,
   };
+}
+
+function isPlaceholderTitle(title: string | undefined) {
+  const normalized = title?.trim().toLowerCase();
+  return (
+    !normalized ||
+    normalized === "untitled" ||
+    normalized === "未命名文档" ||
+    normalized === "未命名来源" ||
+    normalized === "new document"
+  );
 }
 
 function isStructuredFieldKey(value: string): value is StructuredFieldKey {
@@ -353,6 +371,122 @@ function candidateText(candidate: GTCandidate): string {
   return typeof content === "string" ? content : JSON.stringify(content);
 }
 
+function annotationContentText(content: unknown): string {
+  if (
+    content &&
+    typeof content === "object" &&
+    "text" in content &&
+    typeof (content as { text?: unknown }).text === "string"
+  ) {
+    return (content as { text: string }).text;
+  }
+  return typeof content === "string" ? content : JSON.stringify(content);
+}
+
+function createSourceAnnotations(input: {
+  docId: string;
+  versionId: string;
+  fieldKey: string;
+  content: unknown;
+  sourceRefs: SourceRef[];
+  threadId?: string | null;
+  candidateId?: string | null;
+}): SourceAnnotation[] {
+  const now = isoNow();
+  const blockIds = [
+    ...new Set(
+      input.sourceRefs
+        .map((ref) => ref.block_id)
+        .filter((blockId): blockId is string => Boolean(blockId)),
+    ),
+  ];
+  return blockIds.map((blockId) => {
+    const existing = store
+      .listSourceAnnotations(input.docId, input.versionId)
+      .find(
+        (annotation) =>
+          annotation.block_id === blockId &&
+          annotation.field_key === input.fieldKey &&
+          annotation.candidate_id === (input.candidateId ?? null),
+      );
+    const annotation: SourceAnnotation = {
+      annotation_id: existing?.annotation_id ?? randomUUID(),
+      doc_id: input.docId,
+      version_id: input.versionId,
+      block_id: blockId,
+      field_key: input.fieldKey,
+      content: annotationContentText(input.content),
+      annotation_type: "expert_writeback",
+      thread_id: input.threadId ?? null,
+      candidate_id: input.candidateId ?? null,
+      created_at: existing?.created_at ?? now,
+      updated_at: now,
+    };
+    store.upsertSourceAnnotation(input.docId, annotation);
+    return annotation;
+  });
+}
+
+function upsertQualityIssueSourceAnnotations(
+  docId: string,
+  issueIndex: QualityIssueIndex,
+): SourceAnnotation[] {
+  const now = isoNow();
+  const created: SourceAnnotation[] = [];
+  for (const issue of issueIndex.issues) {
+    for (const blockId of issue.primary_block_ids) {
+      const existing = store
+        .listSourceAnnotations(docId, issueIndex.version_id)
+        .find(
+          (annotation) =>
+            annotation.annotation_type === "quality_issue" &&
+            annotation.issue_id === issue.issue_id &&
+            annotation.block_id === blockId,
+        );
+      const annotation: SourceAnnotation = {
+        annotation_id:
+          existing?.annotation_id ?? `quality-${issue.issue_id}-${blockId}`,
+        doc_id: docId,
+        version_id: issueIndex.version_id,
+        block_id: blockId,
+        field_key: issue.target_field ?? "general",
+        content: issue.summary,
+        annotation_type: "quality_issue",
+        issue_id: issue.issue_id,
+        severity: issue.severity,
+        issue_type: issue.issue_type,
+        block_role: "primary",
+        recommended_question: issue.recommended_question,
+        thread_id: null,
+        candidate_id: null,
+        created_at: existing?.created_at ?? now,
+        updated_at: now,
+      };
+      store.upsertSourceAnnotation(docId, annotation);
+      created.push(annotation);
+    }
+  }
+  return created;
+}
+
+function persistQualityArtifacts(input: {
+  docId: string;
+  versionId: string;
+  ir: DocumentIR;
+  triage: GlobalQualityTriage;
+}): QualityIssueIndex {
+  store.writeGlobalQualityTriage(input.docId, input.versionId, input.triage);
+  const issueIndex = deriveQualityIssueIndexFromTriage({
+    docId: input.docId,
+    versionId: input.versionId,
+    triage: input.triage,
+    ir: input.ir,
+  });
+  store.writeQualityIssueIndex(input.docId, input.versionId, issueIndex);
+  upsertQualityIssueSourceAnnotations(input.docId, issueIndex);
+  return issueIndex;
+}
+
 function compareScorecards(
   a: ReturnType<typeof computeExtractionScorecard>,
   b: ReturnType<typeof computeExtractionScorecard>,
@@ -430,6 +564,9 @@ app.post("/documents/:docId/sources", async (c) => {
   const buf = Buffer.from(await file.arrayBuffer());
   const fileId = randomUUID();
   const path = store.saveImmutableUpload(docId, fileId, file.name, buf);
+  if (meta.sources.length === 0 || isPlaceholderTitle(meta.title)) {
+    meta.title = file.name;
+  }
   meta.sources.push({ file_id: fileId, filename: file.name, stored_path: path });
   meta.audit.push({
     at: new Date().toISOString(),
@@ -468,6 +605,16 @@ app.post("/documents/:docId/extract", async (c) => {
   if (requestedMode === "deep" || requestedMode === "llm") {
     const { draft, structuring_mode, diagnostics } =
       await orchestrator.runA1StructuringAsync(ir);
+    const {
+      triage: global_quality_triage,
+      triage_mode: quality_triage_mode,
+    } = await orchestrator.runA1GlobalQualityTriageAsync(ir);
+    const quality_issue_index = persistQualityArtifacts({
+      docId,
+      versionId,
+      ir,
+      triage: global_quality_triage,
+    });
     store.writeDraft(docId, versionId, draft);
     meta.document_status = "Extracted";
     meta.audit.push({
@@ -481,13 +628,18 @@ app.post("/documents/:docId/extract", async (c) => {
     });
     store.writeMeta(meta);
     const scorecard = computeExtractionScorecard({ draft, ir });
-    const improvement_plan = buildImprovementPlan(scorecard, draft, ir);
+    const improvement_plan = mergeGlobalTriageIntoImprovementPlan(
+      buildImprovementPlan(scorecard, draft, ir),
+      global_quality_triage,
+    );
     return c.json({
       draft,
       scorecard,
       improvement_plan,
       structuring_mode,
-      quality_triage_mode: "deep_structuring",
+      quality_triage_mode,
+      global_quality_triage,
+      quality_issue_index,
       parse_diagnostics: buildParseDiagnostics(ir),
       structuring_diagnostics: diagnostics,
     });
@@ -513,6 +665,12 @@ app.post("/documents/:docId/extract", async (c) => {
     }),
   });
   store.writeMeta(meta);
+  const quality_issue_index = persistQualityArtifacts({
+    docId,
+    versionId,
+    ir,
+    triage: global_quality_triage,
+  });
   const scorecard = computeExtractionScorecard({ draft, ir });
   const improvement_plan = mergeGlobalTriageIntoImprovementPlan(
     buildImprovementPlan(scorecard, draft, ir),
@@ -525,6 +683,7 @@ app.post("/documents/:docId/extract", async (c) => {
     structuring_mode,
     quality_triage_mode,
     global_quality_triage,
+    quality_issue_index,
     parse_diagnostics: buildParseDiagnostics(ir),
     structuring_diagnostics: diagnostics,
   });
@@ -573,6 +732,15 @@ app.get("/documents/:docId/draft", async (c) => {
   } catch {
     return c.json(null);
   }
+});
+
+app.get("/documents/:docId/source-annotations", async (c) => {
+  const docId = c.req.param("docId");
+  const meta = store.readMeta(docId);
+  const versionId = c.req.query("version_id") ?? meta.current_version_id;
+  return c.json({
+    annotations: store.listSourceAnnotations(docId, versionId),
+  });
 });
 
 app.get("/documents/:docId/versions/:versionId/assets/:assetKey", async (c) => {
@@ -630,7 +798,33 @@ app.get("/documents/:docId/improvement-plan", async (c) => {
   const draft = await safeDraft(docId, versionId);
   if (!draft) return c.json({ error: "no draft" }, 400);
   const scorecard = computeExtractionScorecard({ draft, ir });
-  return c.json(buildImprovementPlan(scorecard, draft, ir));
+  const basePlan = buildImprovementPlan(scorecard, draft, ir);
+  const storedTriage = store.readGlobalQualityTriage(docId, versionId);
+  return c.json(
+    storedTriage
+      ? mergeGlobalTriageIntoImprovementPlan(basePlan, storedTriage)
+      : basePlan,
+  );
+});
+
+app.get("/documents/:docId/quality-annotations", async (c) => {
+  const docId = c.req.param("docId");
+  const meta = store.readMeta(docId);
+  const versionId = c.req.query("version_id") ?? meta.current_version_id;
+  const issueIndex =
+    store.readQualityIssueIndex(docId, versionId) ?? {
+      doc_id: docId,
+      version_id: versionId,
+      generated_at: new Date(0).toISOString(),
+      issues: [],
+    };
+  const annotations = store
+    .listSourceAnnotations(docId, versionId)
+    .filter((annotation) => annotation.annotation_type === "quality_issue");
+  return c.json({
+    issue_index: issueIndex,
+    annotations,
+  });
 });
 
 app.get("/documents/:docId/expert-memory", async (c) => {
@@ -773,7 +967,7 @@ app.post("/documents/:docId/gt-candidates/:candidateId/confirm", async (c) => {
   }
   const answerText =
     bodyString(body, "edited_text") ?? bodyString(body, "answer_text") ?? candidateText(candidate);
-  const draft = store.readDraft(docId, meta.current_version_id);
+  const draft = readDraftOrEmpty(docId, meta.current_version_id);
   const item: GroundTruthFieldItem = {
     content: { text: answerText, from_gt_candidate: candidateId },
     status: "Drafted",
@@ -808,6 +1002,15 @@ app.post("/documents/:docId/gt-candidates/:candidateId/confirm", async (c) => {
     candidate_id: candidateId,
     field_key: candidate.field_key,
   });
+  const sourceAnnotations = createSourceAnnotations({
+    docId,
+    versionId: meta.current_version_id,
+    fieldKey: candidate.field_key,
+    content: item.content,
+    sourceRefs: candidate.source_refs,
+    threadId: candidate.thread_id,
+    candidateId,
+  });
   completeThread(docId, candidate.thread_id, {
     candidate_id: candidateId,
     field_key: candidate.field_key,
@@ -821,6 +1024,7 @@ app.post("/documents/:docId/gt-candidates/:candidateId/confirm", async (c) => {
     draft: nextDraft,
     scorecard,
     improvement_plan,
+    source_annotations: sourceAnnotations,
   });
 });
 
@@ -1023,7 +1227,7 @@ app.post("/documents/:docId/qa/apply", async (c) => {
         ? body.answer_text
         : "";
   if (!answerText.trim()) return c.json({ error: "empty answer" }, 400);
-  const draft = store.readDraft(docId, meta.current_version_id);
+  const draft = readDraftOrEmpty(docId, meta.current_version_id);
   const item: GroundTruthFieldItem = {
     content: { text: answerText.trim(), from_qa: true },
     status: "Drafted",
@@ -1072,6 +1276,15 @@ app.post("/documents/:docId/qa/apply", async (c) => {
     answer_text: answerText.trim(),
     mode: body.mode === "replace" ? "replace" : "append",
   });
+  const sourceAnnotations = createSourceAnnotations({
+    docId,
+    versionId: meta.current_version_id,
+    fieldKey,
+    content: item.content,
+    sourceRefs: item.source_refs,
+    threadId,
+    candidateId: bodyString(body, "candidate_id"),
+  });
   completeThread(docId, threadId, {
     field_key: fieldKey,
     answer_text: answerText.trim(),
@@ -1084,6 +1297,7 @@ app.post("/documents/:docId/qa/apply", async (c) => {
     audit_entry: auditEntry,
     scorecard,
     improvement_plan,
+    source_annotations: sourceAnnotations,
   });
 });
 
@@ -1095,7 +1309,7 @@ app.patch("/documents/:docId/draft", async (c) => {
   if (!isStructuredFieldKey(fieldKey)) {
     return c.json({ error: "invalid field_key" }, 400);
   }
-  const draft = store.readDraft(docId, meta.current_version_id);
+  const draft = readDraftOrEmpty(docId, meta.current_version_id);
   const item: GroundTruthFieldItem = {
     content: body.content ?? { text: String(body.text ?? "") },
     status: "Drafted",
@@ -1144,7 +1358,7 @@ app.post("/documents/:docId/suggestions/:sid/apply", async (c) => {
   const suggestions = store.readSuggestions(docId);
   const s = suggestions.find((x) => x.suggestion_id === sid);
   if (!s) return c.json({ error: "not found" }, 404);
-  let draft = store.readDraft(docId, meta.current_version_id);
+  let draft = readDraftOrEmpty(docId, meta.current_version_id);
   const { draft: next, summary } = orchestrator.applySuggestionToDraft(
     draft,
     s,
@@ -1185,6 +1399,7 @@ app.post("/documents/:docId/versions", async (c) => {
   }
   store.writeIR(docId, newVid, ir);
   store.writeDraft(docId, newVid, draft);
+  store.copySourceAnnotations(docId, prevVid, newVid);
   const nextDraftText = JSON.stringify(draft);
   const summary = orchestrator.summarizeVersionDiff(prevDraftText, nextDraftText);
   const record = {
@@ -1264,6 +1479,14 @@ async function safeDraft(
     return store.readDraft(docId, versionId);
   } catch {
     return null;
+  }
+}
+
+function readDraftOrEmpty(docId: string, versionId: string): GroundTruthDraft {
+  try {
+    return store.readDraft(docId, versionId);
+  } catch {
+    return emptyGroundTruthDraft(docId, versionId);
   }
 }
 

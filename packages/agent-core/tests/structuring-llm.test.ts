@@ -9,6 +9,7 @@ import {
 import {
   ARRAY_STRUCTURED_FIELD_KEYS,
   collectDraftQualityIssues,
+  deriveQualityIssueIndexFromTriage,
   normalizeLlmStructuredFields,
   runGlobalQualityTriageWithLlmOrFallback,
   runStructuringWithLlmOrFallback,
@@ -18,20 +19,28 @@ vi.mock("../src/llm-client.js", () => ({
   chatCompletionText: vi.fn(async () => {
     throw new Error("TimeoutError: structuring request timed out");
   }),
-  resolveLlmRequestConfig: vi.fn((opts: { label?: string; timeoutMs?: number }) => ({
-    provider: "deepseek",
-    base: "https://api.deepseek.com/v1",
-    apiKey: "test-key",
-    model:
-      opts.label === "structuring.global_triage"
-        ? "deepseek-v4-flash"
-        : "deepseek-v4-pro",
-    timeoutMs: opts.timeoutMs ?? 30000,
-    responseJson: true,
-    label: opts.label ?? "chat.completions",
-    route:
-      opts.label === "structuring.global_triage" ? "triage" : "default",
-  })),
+  resolveLlmRequestConfig: vi.fn(
+    (opts: { label?: string; timeoutMs?: number; provider?: string }) => ({
+      provider: opts.provider ?? "deepseek",
+      base:
+        opts.provider === "dashscope"
+          ? "https://dashscope.aliyuncs.com/compatible-mode/v1"
+          : "https://api.deepseek.com/v1",
+      apiKey: "test-key",
+      model:
+        opts.provider === "dashscope"
+          ? "qwen-plus"
+          : opts.label === "structuring.global_triage"
+            ? "deepseek-v4-flash"
+            : "deepseek-v4-pro",
+      timeoutMs: opts.timeoutMs ?? 30000,
+      maxTokens: opts.label === "structuring.global_triage" ? 2000 : undefined,
+      responseJson: true,
+      label: opts.label ?? "chat.completions",
+      route:
+        opts.label === "structuring.global_triage" ? "triage" : "default",
+    }),
+  ),
 }));
 
 afterEach(() => {
@@ -365,6 +374,49 @@ describe("runStructuringWithLlmOrFallback", () => {
   });
 });
 
+describe("deriveQualityIssueIndexFromTriage", () => {
+  it("creates block-level issues and filters invalid block ids", () => {
+    const ir = priorityFieldIr();
+
+    const index = deriveQualityIssueIndexFromTriage({
+      docId: "doc-priority",
+      versionId: "v1",
+      triage: {
+        summary: "全文显示诊断流程存在，但判断标准不完整。",
+        major_gaps: [
+          {
+            field_key: "judgment_criteria",
+            severity: "high",
+            message: "判断标准缺少阈值。",
+            source_refs: [{ block_id: "b-criteria" }, { block_id: "missing" }],
+          },
+        ],
+        recommended_tasks: [
+          {
+            task_id: "task-criteria",
+            title: "补充判断标准",
+            reason: "当前内容只有判断动作，没有正常/异常阈值。",
+            question: "这里的正常、异常判断标准是什么？",
+            target_field: "judgment_criteria",
+            source_block_ids: ["b-criteria", "missing"],
+            priority: "high",
+          },
+        ],
+        suggested_questions: [],
+        source_refs: [{ block_id: "b-basis" }],
+      },
+      ir,
+      now: "2026-05-02T07:00:00.000Z",
+    });
+
+    expect(index.issues).toHaveLength(1);
+    expect(index.issues[0]?.issue_id).toBe("task-criteria");
+    expect(index.issues[0]?.primary_block_ids).toEqual(["b-criteria"]);
+    expect(index.issues[0]?.supporting_block_ids).toEqual(["b-basis"]);
+    expect(index.issues[0]?.severity).toBe("high");
+  });
+});
+
 describe("runGlobalQualityTriageWithLlmOrFallback", () => {
   it("runs a single lightweight LLM triage call on success", async () => {
     process.env.EBS_LLM_STRUCTURING = "1";
@@ -416,6 +468,21 @@ describe("runGlobalQualityTriageWithLlmOrFallback", () => {
         }),
       }),
     );
+    expect(result.diagnostics.attempts[0]?.system_prompt).toContain(
+      "recommended_tasks.question",
+    );
+    expect(result.diagnostics.attempts[0]?.system_prompt).toContain(
+      "Simplified Chinese",
+    );
+    expect(result.diagnostics.attempts[0]?.user_prompt).toContain(
+      "business users",
+    );
+    expect(result.diagnostics.attempts[0]?.user_prompt).toContain(
+      "Field interview guidance",
+    );
+    expect(result.diagnostics.attempts[0]?.user_prompt).toContain(
+      "您通常通过哪些核心指标",
+    );
     expect(mockedChatCompletionText).toHaveBeenCalledTimes(1);
     expect(mockedChatCompletionText).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -448,6 +515,69 @@ describe("runGlobalQualityTriageWithLlmOrFallback", () => {
     expect(chatCompletionText).toHaveBeenCalledWith(
       expect.objectContaining({
         label: "structuring.global_triage",
+      }),
+    );
+  });
+
+  it("retries global triage with DashScope when DeepSeek returns empty content", async () => {
+    process.env.EBS_LLM_STRUCTURING = "1";
+    process.env.DASHSCOPE_API_KEY = "dashscope-key";
+    process.env.DASHSCOPE_MODEL = "qwen-plus";
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText
+      .mockRejectedValueOnce(new Error("LLM returned empty message content"))
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          summary: "备用模型完成诊断。",
+          major_gaps: [],
+          recommended_tasks: [
+            {
+              title: "补充执行步骤",
+              reason: "文档缺少操作步骤。",
+              question: "具体怎么执行？",
+              target_field: "execution_steps",
+              source_block_ids: ["b1"],
+              priority: "high",
+            },
+          ],
+          suggested_questions: [],
+          source_refs: ["b1"],
+        }),
+      );
+
+    const result = await runGlobalQualityTriageWithLlmOrFallback(sampleIr());
+
+    expect(result.triage_mode).toBe("llm");
+    expect(result.triage.summary).toBe("备用模型完成诊断。");
+    expect(result.triage.recommended_tasks[0]?.question).toContain(
+      "能不能请您按照实际操作顺序",
+    );
+    expect(result.triage.recommended_tasks[0]?.source_block_ids).toEqual(["b1"]);
+    expect(result.triage.suggested_questions[0]).toEqual(
+      expect.objectContaining({
+        target_field: "execution_steps",
+        source_block_ids: ["b1"],
+      }),
+    );
+    expect(result.diagnostics.attempts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: "structuring.global_triage",
+          status: "failed",
+          reason: "empty_response",
+        }),
+        expect.objectContaining({
+          label: "structuring.global_triage.fallback_dashscope",
+          provider: "dashscope",
+          status: "ok",
+        }),
+      ]),
+    );
+    expect(mockedChatCompletionText).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        label: "structuring.global_triage.fallback_dashscope",
+        provider: "dashscope",
       }),
     );
   });

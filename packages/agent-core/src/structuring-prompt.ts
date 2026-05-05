@@ -1,5 +1,6 @@
 import type { DocumentIR } from "@ebs/document-ir";
 import { STRUCTURED_FIELD_KEYS } from "@ebs/ground-truth-schema";
+import { guidanceForPrompt } from "./question-guidance.js";
 
 const MAX_BLOCK_CHARS = 4000;
 const DEFAULT_MAX_COMPACT_BLOCKS = 80;
@@ -302,7 +303,24 @@ ${context.text}`,
 }
 
 export function buildGlobalQualityTriageSystemPrompt(): string {
-  return `Return JSON only. Lightweight quality triage. Use severity/priority only: low, medium, high. source_refs must be objects with block_id. Keep every text field short.`;
+  return `Return JSON only. Lightweight quality triage after reading the whole document context.
+Use severity/priority only: low, medium, high. source_refs must be objects with block_id.
+For recommended_tasks.source_block_ids, include only the blocks that truly need modification or expert confirmation.
+Make recommended_tasks.question and suggested_questions.question sound like concise expert-interview questions. Refer to the field guidance in the user prompt, but do not copy it mechanically.
+All user-facing text values must be Simplified Chinese and business-friendly. Avoid English diagnostic phrases, internal model wording, and academic labels.
+Use top-level source_refs and major_gaps.source_refs for supporting evidence, not for broad highlighting.
+Do not force a block id when a gap is document-level. Keep every text field short.`;
+}
+
+function globalTriageGuidancePrompt(): string {
+  return [
+    guidanceForPrompt("execution_steps", 2),
+    guidanceForPrompt("judgment_basis", 2),
+    guidanceForPrompt("judgment_criteria", 2),
+    guidanceForPrompt("tool_templates", 2),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 export function buildGlobalQualityTriagePromptInput(ir: DocumentIR): {
@@ -322,9 +340,11 @@ export function buildGlobalQualityTriagePromptInput(ir: DocumentIR): {
     prompt: `doc_id: ${ir.doc_id}
 version_id: ${ir.version_id}
 
-Goal: find at most 3 key tasks for the user. Prefer these fields in order: execution_steps, judgment_basis, judgment_criteria, tool_templates. Use the navigation index to scan the whole document structure, then use selected key blocks for detail. Do not map all fields. Return at most 3 major_gaps, 3 recommended_tasks, 3 suggested_questions. Keep each message/reason/question concise.
+Goal: find at most 3 key tasks for the user. Prefer these fields in order: execution_steps, judgment_basis, judgment_criteria, tool_templates. Use the navigation index to scan the whole document structure, then use selected key blocks for detail. Do not map all fields. Return at most 3 major_gaps, 3 recommended_tasks, 3 suggested_questions. Keep each message/reason/question concise and written in Simplified Chinese for business users.
 JSON keys: summary, major_gaps[{field_key,severity,message,source_refs[{block_id}]}], recommended_tasks[{title,reason,question,target_field,source_block_ids,priority}], suggested_questions[{question,target_field,source_block_ids}], source_refs[{block_id}].
 Every recommended task must include target_field or at least one valid source_block_id from the navigation index.
+Field interview guidance:
+${globalTriageGuidancePrompt()}
 
 ${navigationIndex}
 

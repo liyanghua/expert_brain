@@ -6,6 +6,7 @@ export {
 } from "@ebs/ground-truth-schema";
 export {
   isLlmStructuringEnabled,
+  deriveQualityIssueIndexFromTriage,
   runGlobalQualityTriageWithLlmOrFallback,
   runStructuringWithLlmOrFallback,
   type GlobalQualityTriageMode,

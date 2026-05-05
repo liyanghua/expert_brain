@@ -11,6 +11,9 @@ import type {
   GlobalQualityTriage,
   GroundTruthDraft,
   GroundTruthFieldItem,
+  QualityIssue,
+  QualityIssueIndex,
+  SourceAnnotation,
   SuggestionRecord,
   TaskThread,
   ThreadStep,
@@ -20,6 +23,11 @@ import {
   GROUND_TRUTH_FIELD_KEYS,
   MAX_PRIMARY_TASKS,
 } from "@ebs/ground-truth-schema";
+import {
+  describeEvidenceForOps,
+  describeStructuredFieldForOps,
+} from "./compare-copy";
+import { describeQualityIssueForOps } from "./quality-copy";
 
 const api = (path: string) => `/api${path}`;
 
@@ -64,6 +72,7 @@ type CandidateQuestion = {
   question: string;
   target_field?: string;
   source_block_id?: string;
+  source_block_ids?: string[];
 };
 
 type ParseDiagnostics = {
@@ -132,8 +141,14 @@ type ExtractResponse = {
   structuring_mode?: string;
   quality_triage_mode?: string;
   global_quality_triage?: GlobalQualityTriage;
+  quality_issue_index?: QualityIssueIndex;
   parse_diagnostics?: ParseDiagnostics;
   structuring_diagnostics?: StructuringDiagnostics;
+};
+
+type QualityAnnotationResponse = {
+  issue_index: QualityIssueIndex;
+  annotations: SourceAnnotation[];
 };
 
 type QAResponse = {
@@ -210,6 +225,7 @@ type RecommendedTaskRow = {
 type QaContextSource =
   | "none"
   | "raw_block"
+  | "quality_issue"
   | "task"
   | "field"
   | "candidate"
@@ -373,9 +389,9 @@ type ConversationEvent =
 type ParseStatus = "idle" | "uploading" | "processing" | "waiting_ir" | "ready";
 
 const LLM_STEPS = [
-  "读取文档结构",
-  "发现主要质量缺口",
-  "生成推荐任务",
+  "扫描结构与证据",
+  "研判缺口优先级",
+  "整理补强任务",
 ] as const;
 
 const QUESTION_REFINE_STEPS = [
@@ -389,7 +405,7 @@ const idleLlmProgress: LlmProgress = {
   status: "idle",
   stepIndex: 0,
   elapsedMs: 0,
-  message: "等待质量检测",
+  message: "等待文档审阅",
 };
 
 const idleQuestionRefineProgress: QuestionRefineProgress = {
@@ -473,6 +489,62 @@ const emptyWorkbenchContext: ActiveWorkbenchContext = {
   evidenceBlockIds: [],
 };
 
+function sourceBlockDomId(blockId: string) {
+  return `source-block-${blockId.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+}
+
+function sourceBlockTypeLabel(blockType: string) {
+  const labels: Record<string, string> = {
+    heading: "章节",
+    paragraph: "正文",
+    list: "列表",
+    table: "表格",
+    image: "图片",
+    outline: "大纲",
+  };
+  return labels[blockType] ?? blockType;
+}
+
+function sourceBlockExcerpt(text: string, limit = 72) {
+  const compact = text.replace(/\s+/g, " ").trim();
+  return compact.length > limit ? `${compact.slice(0, limit)}...` : compact;
+}
+
+function parseSourceTable(text: string): { headers: string[]; rows: string[][] } | null {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length < 2) return null;
+
+  const splitPipeRow = (line: string) =>
+    line
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((cell) => cell.trim());
+  const isMarkdownSeparator = (cells: string[]) =>
+    cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+
+  if (lines.every((line) => line.includes("|"))) {
+    const rawRows = lines.map(splitPipeRow).filter((row) => row.length > 1);
+    const rows = rawRows.filter((row) => !isMarkdownSeparator(row));
+    if (rows.length >= 2) {
+      const headers = rows[0]!;
+      return { headers, rows: rows.slice(1) };
+    }
+  }
+
+  if (lines.every((line) => line.includes("\t"))) {
+    const rows = lines.map((line) => line.split("\t").map((cell) => cell.trim()));
+    if (rows.length >= 2 && rows[0]!.length > 1) {
+      return { headers: rows[0]!, rows: rows.slice(1) };
+    }
+  }
+
+  return null;
+}
+
 function uniqueStrings(values: (string | null | undefined)[]) {
   return [...new Set(values.filter((value): value is string => Boolean(value)))];
 }
@@ -545,10 +617,79 @@ function llmDiagnosticSummary(
   diagnostic?: Pick<LlmDebugDiagnostics, "status" | "reason" | "message">,
 ) {
   if (!diagnostic) return "";
+  if (diagnostic.status === "failed") {
+    if (diagnostic.reason === "empty_response") {
+      return "主模型没有返回可用内容；系统会优先尝试备用模型，仍失败时再使用本地规则兜底。";
+    }
+    if (diagnostic.reason === "json_parse_error") {
+      return "模型已返回内容，但 JSON 结构不完整；系统已使用安全兜底生成回答，可继续处理候选内容。";
+    }
+    if (diagnostic.reason === "schema_validation_error") {
+      return "模型已返回内容，但回写结构未通过字段校验；系统已使用安全兜底结果，避免写入错误字段。";
+    }
+    if (diagnostic.reason === "candidate_validation_error") {
+      return "回答已生成，但候选回写卡片暂时无法创建；可以基于回答继续追问或重试。";
+    }
+  }
   const status = diagnostic.status ? `status=${diagnostic.status}` : "";
   const reason = diagnostic.reason ? `reason=${diagnostic.reason}` : "";
   const message = diagnostic.message ? `message=${diagnostic.message}` : "";
   return [status, reason, message].filter(Boolean).join(" · ");
+}
+
+function questionRefineCompletionMessage(diagnostic?: LlmDebugDiagnostics) {
+  if (diagnostic?.status === "failed") {
+    return "已使用本地问题草稿，可继续提问";
+  }
+  if (diagnostic?.provider === "dashscope") {
+    return "备用模型已生成追问草稿，可编辑后提交";
+  }
+  return "已生成追问草稿，可编辑后提交";
+}
+
+function qualityCompletionMessage(input: {
+  mode?: string;
+  diagnostics?: StructuringDiagnostics;
+}) {
+  const attempts = input.diagnostics?.attempts ?? [];
+  const fallbackSucceeded = attempts.some(
+    (attempt) =>
+      attempt.stage === "global_triage" &&
+      attempt.provider === "dashscope" &&
+      attempt.status === "ok",
+  );
+  const fallbackFailed = attempts.some(
+    (attempt) =>
+      attempt.stage === "global_triage" &&
+      attempt.provider === "dashscope" &&
+      attempt.status === "failed",
+  );
+  if (input.mode === "llm") {
+    return fallbackSucceeded
+      ? "备用模型已完成文档审阅，已整理主要缺口和推荐任务"
+      : "文档审阅完成，已整理主要缺口和推荐任务";
+  }
+  if (input.mode === "deep_structuring") return "深度结构化抽取完成";
+  if (input.mode === "rules_fallback") {
+    return fallbackFailed
+      ? "主模型和备用模型都未返回可用结果，已用本地规则整理待补强任务"
+      : "主模型暂时不可用，已用本地规则整理待补强任务";
+  }
+  return "文档审阅完成，已使用本地规则生成推荐任务";
+}
+
+function writebackErrorMessage(err: unknown) {
+  const raw = err instanceof Error ? err.message : String(err);
+  if (/draft\.json|ENOENT|no such file/i.test(raw)) {
+    return "回写失败：当前版本还没有草稿文件，系统应自动创建空草稿后写入。请重试或重新运行服务后再试。";
+  }
+  if (/^\d{3}\s/.test(raw) || /HTTP/i.test(raw)) {
+    return `回写失败：后端写入接口返回错误。${raw}`;
+  }
+  if (/Failed to fetch|NetworkError|fetch failed/i.test(raw)) {
+    return `回写失败：网络请求未成功发出。${raw}`;
+  }
+  return `回写失败：${raw}`;
 }
 
 function qaErrorMessage(err: unknown) {
@@ -563,7 +704,17 @@ function qaErrorMessage(err: unknown) {
         message?: string;
       };
       const summary = llmDiagnosticSummary(parsed.llm_diagnostics);
-      if (summary) return `QA 失败：${summary}`;
+      if (summary) {
+        const reason = parsed.llm_diagnostics?.reason;
+        if (
+          reason === "json_parse_error" ||
+          reason === "schema_validation_error" ||
+          reason === "candidate_validation_error"
+        ) {
+          return `QA 已使用安全兜底：${summary}`;
+        }
+        return `QA 失败：${summary}`;
+      }
       body = parsed.message ?? parsed.error ?? raw;
     } catch {
       body = raw;
@@ -591,7 +742,7 @@ function friendlyQualitySummary(progress: LlmProgress) {
   if (progress.status === "running") return progress.message;
   if (progress.status === "error") return progress.message;
   const triage = progress.globalQualityTriage;
-  if (!triage) return "质量检测已完成，我会把优先补强点整理成任务，方便逐项处理。";
+  if (!triage) return "我已把文档里的优先补强点整理成任务，方便你逐项处理。";
   const points = [
     ...(triage.recommended_tasks ?? []).map((task) =>
       friendlyTaskTitle({
@@ -610,9 +761,9 @@ function friendlyQualitySummary(progress: LlmProgress) {
     .filter(Boolean)
     .slice(0, 3);
   if (points.length === 0) {
-    return "质量检测已完成，当前没有发现必须优先处理的全局缺口。";
+    return "审阅完成，当前没有发现必须优先处理的全局缺口。";
   }
-  return `我发现 ${points.length} 个优先补强点：${points.join("、")}。`;
+  return `我先为你标出 ${points.length} 个优先补强点：${points.join("、")}。`;
 }
 
 function stepLabel(step: ThreadStep) {
@@ -687,7 +838,7 @@ function sourceBlockSummary(candidate: GTCandidate) {
 }
 
 type LeftMode = "original" | "structured" | "compare";
-type DrawerTab = "suggestions" | "diff" | "fields" | "audit" | "eval";
+type StudioTab = "suggestions" | "diff" | "fields" | "eval" | "audit" | "debug";
 type PagePhase =
   | "empty"
   | "imported"
@@ -713,7 +864,7 @@ export function App() {
   const [activeWorkbenchContext, setActiveWorkbenchContext] =
     useState<ActiveWorkbenchContext>(emptyWorkbenchContext);
   const [leftMode, setLeftMode] = useState<LeftMode>("original");
-  const [drawerTab, setDrawerTab] = useState<DrawerTab>("suggestions");
+  const [studioTab, setStudioTab] = useState<StudioTab>("suggestions");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingAnswer, setEditingAnswer] = useState("");
@@ -742,6 +893,9 @@ export function App() {
   const [threads, setThreads] = useState<TaskThread[]>([]);
   const [gtCandidates, setGtCandidates] = useState<GTCandidate[]>([]);
   const [expertNotes, setExpertNotes] = useState<ExpertNote[]>([]);
+  const [sourceAnnotations, setSourceAnnotations] = useState<SourceAnnotation[]>([]);
+  const [qualityIssueIndex, setQualityIssueIndex] =
+    useState<QualityIssueIndex | null>(null);
   const [candidateEdits, setCandidateEdits] = useState<Record<string, string>>({});
   const [candidateModes, setCandidateModes] = useState<
     Record<string, "append" | "replace">
@@ -764,10 +918,10 @@ export function App() {
   const [questionRefineProgress, setQuestionRefineProgress] =
     useState<QuestionRefineProgress>(idleQuestionRefineProgress);
   const [statusbarExpanded, setStatusbarExpanded] = useState(false);
-  const [llmDebugOpen, setLlmDebugOpen] = useState(false);
+  const [workbenchCollapsed, setWorkbenchCollapsed] = useState(true);
+  const [studioDrawerOpen, setStudioDrawerOpen] = useState(false);
   const [llmDebugEntries, setLlmDebugEntries] = useState<LlmDebugEntry[]>([]);
   const [leftPanePercent, setLeftPanePercent] = useState(58);
-  const [bottomDrawerHeight, setBottomDrawerHeight] = useState(240);
   const [autoFollowConversation, setAutoFollowConversation] = useState(true);
   const [hasUnseenConversationUpdate, setHasUnseenConversationUpdate] =
     useState(false);
@@ -779,9 +933,8 @@ export function App() {
       ({
         "--left-pane-fr": `${leftPanePercent}fr`,
         "--right-pane-fr": `${100 - leftPanePercent}fr`,
-        "--drawer-h": `${bottomDrawerHeight}px`,
       }) as CSSProperties,
-    [bottomDrawerHeight, leftPanePercent],
+    [leftPanePercent],
   );
 
   const isInteractionLocked =
@@ -852,18 +1005,41 @@ export function App() {
       setVersions([]);
     }
     try {
-      const [threadInfo, candidateInfo, noteInfo] = await Promise.all([
+      const [
+        threadInfo,
+        candidateInfo,
+        noteInfo,
+        annotationInfo,
+        qualityAnnotationInfo,
+      ] = await Promise.all([
         fetchJson<ThreadListResponse>(api(`/documents/${id}/threads`)),
         fetchJson<GTCandidateListResponse>(api(`/documents/${id}/gt-candidates`)),
         fetchJson<ExpertNoteListResponse>(api(`/documents/${id}/notes`)),
+        fetchJson<{ annotations: SourceAnnotation[] }>(
+          api(`/documents/${id}/source-annotations`),
+        ),
+        fetchJson<QualityAnnotationResponse>(
+          api(`/documents/${id}/quality-annotations`),
+        ),
       ]);
       setThreads(threadInfo.threads ?? []);
       setGtCandidates(candidateInfo.candidates ?? []);
       setExpertNotes(noteInfo.notes ?? []);
+      const byId = new Map<string, SourceAnnotation>();
+      for (const annotation of annotationInfo.annotations ?? []) {
+        byId.set(annotation.annotation_id, annotation);
+      }
+      for (const annotation of qualityAnnotationInfo.annotations ?? []) {
+        byId.set(annotation.annotation_id, annotation);
+      }
+      setSourceAnnotations([...byId.values()]);
+      setQualityIssueIndex(qualityAnnotationInfo.issue_index ?? null);
     } catch {
       setThreads([]);
       setGtCandidates([]);
       setExpertNotes([]);
+      setSourceAnnotations([]);
+      setQualityIssueIndex(null);
     }
   }, []);
 
@@ -890,21 +1066,6 @@ export function App() {
     window.addEventListener("pointerup", onUp, { once: true });
   }, []);
 
-  const startDrawerResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    const onMove = (moveEvent: PointerEvent) => {
-      const maxHeight = Math.min(520, window.innerHeight * 0.55);
-      const next = window.innerHeight - moveEvent.clientY;
-      setBottomDrawerHeight(Math.min(maxHeight, Math.max(140, next)));
-    };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp, { once: true });
-  }, []);
-
   const handlePaneResizerKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
       const step = 3;
@@ -920,27 +1081,6 @@ export function App() {
       if (event.key === "Home" || event.key === "End") {
         event.preventDefault();
         setLeftPanePercent(event.key === "Home" ? 38 : 68);
-      }
-    },
-    [],
-  );
-
-  const handleDrawerResizerKeyDown = useCallback(
-    (event: ReactKeyboardEvent<HTMLDivElement>) => {
-      const maxHeight = Math.min(520, window.innerHeight * 0.55);
-      const step = 24;
-      if (event.key === "ArrowUp" || event.key === "ArrowDown") {
-        event.preventDefault();
-        setBottomDrawerHeight((value) =>
-          Math.min(
-            maxHeight,
-            Math.max(140, value + (event.key === "ArrowUp" ? step : -step)),
-          ),
-        );
-      }
-      if (event.key === "Home" || event.key === "End") {
-        event.preventDefault();
-        setBottomDrawerHeight(event.key === "Home" ? 140 : maxHeight);
       }
     },
     [],
@@ -977,10 +1117,6 @@ export function App() {
     }
     return map;
   }, [fieldItems]);
-
-  const selectedBlockFields = selectedBlockId
-    ? (blockFieldIndex.get(selectedBlockId) ?? [])
-    : [];
 
   const candidateQuestions = improvementPlan?.candidate_questions ?? [];
 
@@ -1077,10 +1213,7 @@ export function App() {
     (focusContext.fieldKey
       ? fieldQualityByKey.get(focusContext.fieldKey)
       : undefined) ??
-    (activeFieldKey ? fieldQualityByKey.get(activeFieldKey) : undefined) ??
-    (selectedBlockFields[0]
-      ? fieldQualityByKey.get(selectedBlockFields[0]!.fieldKey)
-      : undefined);
+    (activeFieldKey ? fieldQualityByKey.get(activeFieldKey) : undefined);
 
   const focusTaskRows = useMemo(
     () =>
@@ -1110,11 +1243,14 @@ export function App() {
       return focusContext.evidenceBlockIds;
     }
     if (focusContext.blockId) return [focusContext.blockId];
-    if (activeFieldQuality?.sourceBlockIds.length) {
+    if (
+      (focusContext.fieldKey || activeFieldKey) &&
+      activeFieldQuality?.sourceBlockIds.length
+    ) {
       return activeFieldQuality.sourceBlockIds.slice(0, 3);
     }
-    return selectedBlockId ? [selectedBlockId] : [];
-  }, [activeFieldQuality, focusContext, selectedBlockId]);
+    return [];
+  }, [activeFieldKey, activeFieldQuality, focusContext]);
 
   const focusEvidenceBlocks = useMemo(() => {
     if (!ir) return [];
@@ -1122,6 +1258,48 @@ export function App() {
       .map((blockId) => ir.blocks.find((block) => block.block_id === blockId))
       .filter((block): block is DocumentIR["blocks"][number] => Boolean(block));
   }, [focusEvidenceBlockIds, ir]);
+
+  const visibleFocusEvidenceBlockIds = useMemo(() => {
+    if (activeWorkbenchContext.source === "raw_block" && activeWorkbenchContext.blockId) {
+      return [activeWorkbenchContext.blockId];
+    }
+    return focusEvidenceBlockIds;
+  }, [activeWorkbenchContext.blockId, activeWorkbenchContext.source, focusEvidenceBlockIds]);
+
+  const visibleFocusEvidenceBlocks = useMemo(() => {
+    if (!ir) return [];
+    return visibleFocusEvidenceBlockIds
+      .map((blockId) => ir.blocks.find((block) => block.block_id === blockId))
+      .filter((block): block is DocumentIR["blocks"][number] => Boolean(block));
+  }, [ir, visibleFocusEvidenceBlockIds]);
+
+  const sourceMappedBlockCount = useMemo(() => {
+    if (!ir) return 0;
+    return ir.blocks.filter((block) => blockFieldIndex.has(block.block_id)).length;
+  }, [blockFieldIndex, ir]);
+
+  const sourceContextBlockIdSet = useMemo(
+    () => new Set(visibleFocusEvidenceBlockIds),
+    [visibleFocusEvidenceBlockIds],
+  );
+
+  const sourceAnnotationsByBlockId = useMemo(() => {
+    const map = new Map<string, SourceAnnotation[]>();
+    for (const annotation of sourceAnnotations) {
+      const list = map.get(annotation.block_id) ?? [];
+      list.push(annotation);
+      map.set(annotation.block_id, list);
+    }
+    return map;
+  }, [sourceAnnotations]);
+
+  const qualityIssueById = useMemo(() => {
+    const map = new Map<string, QualityIssue>();
+    for (const issue of qualityIssueIndex?.issues ?? []) {
+      map.set(issue.issue_id, issue);
+    }
+    return map;
+  }, [qualityIssueIndex]);
 
   const neighborBlockIds = useCallback(
     (blockId: string, radius = 2) => {
@@ -1135,14 +1313,15 @@ export function App() {
     [ir],
   );
 
+  const explicitFieldQuality =
+    focusContext.fieldKey || activeFieldKey ? activeFieldQuality : null;
+
   const focusRecommendedQuestion =
     focusContext.recommendedQuestion ??
-    activeFieldQuality?.candidateQuestions[0]?.question ??
-    (activeFieldQuality
-      ? `请补充“${activeFieldQuality.label}”：${activeFieldQuality.definition}`
-      : selectedBlock
-        ? "请判断这段原文是否能补充当前结构化草稿，并给出可写入内容。"
-        : "");
+    explicitFieldQuality?.candidateQuestions[0]?.question ??
+    (explicitFieldQuality
+      ? `请补充“${explicitFieldQuality.label}”：${explicitFieldQuality.definition}`
+      : "");
 
   const sortedThreads = useMemo(
     () =>
@@ -1248,7 +1427,10 @@ export function App() {
           fieldKey: question.target_field,
         }),
         targetField: question.target_field ?? null,
-        sourceBlockIds: uniqueStrings([question.source_block_id]),
+        sourceBlockIds: uniqueStrings([
+          question.source_block_id,
+          ...(question.source_block_ids ?? []),
+        ]),
         origin: "quality",
       });
     }
@@ -1298,11 +1480,15 @@ export function App() {
     (task) => task.status !== "completed",
   );
 
+  const pendingRecommendedTaskCount = useMemo(
+    () =>
+      visibleRecommendedTaskQueue.filter((task) => task.status !== "completed")
+        .length,
+    [visibleRecommendedTaskQueue],
+  );
+
   const taskQueueSummary = useMemo(() => {
     if (!draft) return "导入并完成质量检测后，这里会出现推荐任务。";
-    const pending = visibleRecommendedTaskQueue.filter(
-      (task) => task.status !== "completed",
-    ).length;
     const completed = visibleRecommendedTaskQueue.filter(
       (task) => task.status === "completed",
     ).length;
@@ -1310,11 +1496,53 @@ export function App() {
       hiddenRecommendedTaskCount > 0
         ? `，另有 ${hiddenRecommendedTaskCount} 个待优化项已收起`
         : "";
-    if (pending > 0) {
-      return `还有 ${pending} 个主任务待处理，已完成 ${completed} 个${folded}。`;
+    if (pendingRecommendedTaskCount > 0) {
+      return `还有 ${pendingRecommendedTaskCount} 个主任务待处理，已完成 ${completed} 个${folded}。`;
     }
     return `全局主任务已处理完${folded}，可以回到左侧原文，选择局部 block 继续问答修订。`;
-  }, [draft, hiddenRecommendedTaskCount, visibleRecommendedTaskQueue]);
+  }, [
+    draft,
+    hiddenRecommendedTaskCount,
+    pendingRecommendedTaskCount,
+    visibleRecommendedTaskQueue,
+  ]);
+
+  const compareEvidenceBlocks = useMemo(
+    () => {
+      if (visibleFocusEvidenceBlocks.length) {
+        return visibleFocusEvidenceBlocks.slice(0, 4);
+      }
+      if (activeFieldBlocks.length) return activeFieldBlocks.slice(0, 4);
+      const selectedBlock = ir?.blocks.find(
+        (block) => block.block_id === selectedBlockId,
+      );
+      return selectedBlock ? [selectedBlock] : [];
+    },
+    [activeFieldBlocks, ir, selectedBlockId, visibleFocusEvidenceBlocks],
+  );
+
+  const activeFieldOpsCopy = useMemo(
+    () =>
+      activeFieldQuality
+        ? describeStructuredFieldForOps({
+            fieldLabel: activeFieldQuality.label,
+            status: activeFieldQuality.status,
+            statusLabel: activeFieldQuality.statusLabel,
+            reason: activeFieldQuality.reason,
+            itemCount: activeFieldQuality.items.length,
+            sourceCount: activeFieldQuality.sourceBlockIds.length,
+          })
+        : null,
+    [activeFieldQuality],
+  );
+
+  const workbenchContextSummary = useMemo(() => {
+    if (activeFieldQuality) return `当前字段：${activeFieldQuality.label}`;
+    if (visibleFocusEvidenceBlocks.length > 0) {
+      return `原文证据：${visibleFocusEvidenceBlocks.length} 个 block`;
+    }
+    return "未选择上下文";
+  }, [activeFieldQuality, visibleFocusEvidenceBlocks.length]);
 
   const conversationEvents = useMemo<ConversationEvent[]>(() => {
     const events: ConversationEvent[] = [];
@@ -1654,7 +1882,7 @@ export function App() {
     if (isInteractionLocked) return;
     const m = await fetchJson<{ doc_id: string }>(api("/documents"), {
       method: "POST",
-      body: JSON.stringify({ title: "新建文档" }),
+      body: JSON.stringify({ title: "未命名来源" }),
     });
     setDocId(m.doc_id);
     setPhase("empty");
@@ -1667,11 +1895,13 @@ export function App() {
     setLlmProgress(idleLlmProgress);
     setQuestionRefineProgress(idleQuestionRefineProgress);
     setLlmDebugEntries([]);
-    setLlmDebugOpen(false);
+    setStudioDrawerOpen(false);
     setMessages([]);
     setThreads([]);
     setGtCandidates([]);
     setExpertNotes([]);
+    setSourceAnnotations([]);
+    setQualityIssueIndex(null);
     setNoteDraft("");
     await refreshDoc(m.doc_id);
   }
@@ -1684,7 +1914,13 @@ export function App() {
     try {
       const fd = new FormData();
       fd.append("file", f);
-      await fetch(api(`/documents/${docId}/sources`), { method: "POST", body: fd });
+      const uploadResponse = await fetch(api(`/documents/${docId}/sources`), {
+        method: "POST",
+        body: fd,
+      });
+      if (!uploadResponse.ok) throw new Error(`${uploadResponse.status} ${await uploadResponse.text()}`);
+      const uploaded = (await uploadResponse.json()) as { title?: string };
+      setTitle(uploaded.title ?? f.name);
       setParseStatus("processing");
       await fetch(api(`/documents/${docId}/jobs/process-next`), {
         method: "POST",
@@ -1726,18 +1962,17 @@ export function App() {
       setDraft(r.draft);
       if (r.scorecard) setScorecard(r.scorecard);
       if (r.improvement_plan) setImprovementPlan(r.improvement_plan);
+      if (r.quality_issue_index) setQualityIssueIndex(r.quality_issue_index);
       setPhase("extracted");
       setLlmProgress({
         status: "success",
         stepIndex: LLM_STEPS.length - 1,
         startedAt,
         elapsedMs: Date.now() - startedAt,
-        message:
-          r.quality_triage_mode === "llm"
-            ? "轻量质量检测完成，已生成主要缺口和推荐任务"
-            : r.quality_triage_mode === "deep_structuring"
-              ? "深度结构化抽取完成"
-              : "轻量质量检测完成，已使用本地规则生成推荐任务",
+        message: qualityCompletionMessage({
+          mode: r.quality_triage_mode,
+          diagnostics: r.structuring_diagnostics,
+        }),
         diagnostics: r.structuring_diagnostics,
         parseDiagnostics: r.parse_diagnostics,
         globalQualityTriage: r.global_quality_triage,
@@ -1765,7 +2000,7 @@ export function App() {
       qaContext.blockId ??
       focusContext.blockId ??
       focusEvidenceBlockIds[0] ??
-      selectedBlockId;
+      null;
     const targetField =
       qaContext.targetField ?? focusContext.fieldKey ?? activeFieldKey;
     const metric = qaContext.metric ?? focusContext.metric;
@@ -1933,6 +2168,74 @@ export function App() {
     });
   }
 
+  function focusQualityIssueAnnotation(annotation: SourceAnnotation) {
+    if (annotation.annotation_type !== "quality_issue") return;
+    const issue = annotation.issue_id
+      ? qualityIssueById.get(annotation.issue_id)
+      : undefined;
+    const evidenceBlockIds = uniqueStrings([
+      ...(issue?.primary_block_ids ?? [annotation.block_id]),
+      ...(issue?.supporting_block_ids ?? []),
+    ]);
+    const blockId = issue?.primary_block_ids[0] ?? annotation.block_id;
+    const targetField =
+      issue?.target_field ??
+      (annotation.field_key === "general" ? null : annotation.field_key);
+    const question =
+      issue?.recommended_question ??
+      annotation.recommended_question ??
+      `请基于当前质量提示补充“${friendlyFieldLabel(targetField)}”。`;
+    const summary = issue?.summary ?? summarizeContent(annotation.content, 120);
+    setSelectedBlockId(blockId);
+    if (targetField) setActiveFieldKey(targetField);
+    setFocusContext({
+      kind: "gap",
+      fieldKey: targetField,
+      blockId,
+      gapMessage: summary,
+      evidenceBlockIds,
+      recommendedQuestion: question,
+      metric: annotation.issue_type ?? "quality_issue",
+    });
+    setQaContext({
+      source: "quality_issue",
+      mode: "direct_qa",
+      blockId,
+      targetField,
+      metric: annotation.issue_type ?? "quality_issue",
+      evidenceBlockIds,
+      questionSeed: question,
+      gapReason: summary,
+      threadId: null,
+    });
+    setActiveWorkbenchContext({
+      source: "quality_issue",
+      mode: "direct_qa",
+      title: summary,
+      fieldKey: targetField,
+      blockId,
+      evidenceBlockIds,
+      recommendedQuestion: question,
+      gapReason: summary,
+      metric: annotation.issue_type ?? "quality_issue",
+      threadId: null,
+    });
+    setInput(question);
+    window.requestAnimationFrame(() => {
+      chatInputRef.current?.focus();
+      scrollToSourceBlock(blockId);
+    });
+  }
+
+  function clearQaContext() {
+    setFocusContext(emptyFocusContext);
+    setQaContext({ source: "none", mode: "direct_qa", blockId: null });
+    setActiveWorkbenchContext(emptyWorkbenchContext);
+    setSelectedBlockId(null);
+    setActiveFieldKey(null);
+    setInput("");
+  }
+
   async function applySuggestion(s: SuggestionRecord, edited?: string) {
     if (!docId || isInteractionLocked) return;
     await fetchJson(api(`/documents/${docId}/suggestions/${s.suggestion_id}/apply`), {
@@ -1966,7 +2269,8 @@ export function App() {
       }
     }
     setPhase("version");
-    setDrawerTab("diff");
+    setStudioTab("diff");
+    setStudioDrawerOpen(true);
     void refreshDoc(docId);
   }
 
@@ -1983,10 +2287,11 @@ export function App() {
   }
 
   function useCandidateQuestion(q: CandidateQuestion) {
-    setDrawerTab("eval");
+    setStudioTab("eval");
     if (q.target_field) setActiveFieldKey(q.target_field);
     const evidenceBlockIds = uniqueStrings([
       q.source_block_id,
+      ...(q.source_block_ids ?? []),
       ...(q.target_field
         ? (fieldQualityByKey.get(q.target_field)?.sourceBlockIds ?? [])
         : []),
@@ -2029,37 +2334,40 @@ export function App() {
 
   function useRecommendedTask(task: RecommendedTaskRow) {
     setLeftMode("compare");
-    setDrawerTab("eval");
+    setStudioTab("eval");
     if (task.targetField) setActiveFieldKey(task.targetField);
     const evidenceBlockIds = uniqueStrings(task.sourceBlockIds);
-    setFocusContext({
-      kind: task.targetField ? "gap" : "block",
-      fieldKey: task.targetField,
-      blockId: evidenceBlockIds[0] ?? selectedBlockId,
-      evidenceBlockIds,
-      recommendedQuestion: task.question,
-      gapMessage: task.reason,
-    });
-    setQaContext({
+    const blockId = evidenceBlockIds[0] ?? selectedBlockId;
+    const contextSnapshot: QaContext = {
       source: "task",
       mode: "task_refine_then_qa",
-      blockId: evidenceBlockIds[0] ?? selectedBlockId,
+      blockId,
       targetField: task.targetField,
       evidenceBlockIds,
       questionSeed: task.question,
       gapReason: task.reason,
+    };
+    setFocusContext({
+      kind: task.targetField ? "gap" : "block",
+      fieldKey: task.targetField,
+      blockId,
+      evidenceBlockIds,
+      recommendedQuestion: task.question,
+      gapMessage: task.reason,
     });
+    setQaContext(contextSnapshot);
     setActiveWorkbenchContext({
       source: "task",
       mode: "task_refine_then_qa",
       title: task.title,
       fieldKey: task.targetField,
-      blockId: evidenceBlockIds[0] ?? selectedBlockId,
+      blockId,
       evidenceBlockIds,
       recommendedQuestion: task.question,
       gapReason: task.reason,
     });
-    setInput("");
+    setInput(task.question);
+    void refineQuestionForContext(contextSnapshot);
   }
 
   function focusField(row: FieldQualityRow, kind: "field" | "gap" = "field") {
@@ -2174,26 +2482,278 @@ export function App() {
     setInput((current) => current || question);
   }
 
-  async function askWithFocus() {
+  function scrollToSourceBlock(blockId: string) {
+    window.requestAnimationFrame(() => {
+      document
+        .getElementById(sourceBlockDomId(blockId))
+        ?.scrollIntoView({ block: "center", behavior: "smooth" });
+    });
+  }
+
+  function selectSourceBlock(blockId: string) {
+    if (isInteractionLocked) return;
+    setSelectedBlockId(blockId);
+    scrollToSourceBlock(blockId);
+  }
+
+  function renderSourceBlockContent(block: DocumentIR["blocks"][number]) {
+    if (block.block_type === "image" && block.media_uri) {
+      return (
+        <figure className="source-image-frame">
+          <img src={api(block.media_uri)} alt="" />
+        </figure>
+      );
+    }
+    if (block.block_type === "table") {
+      const table = parseSourceTable(block.text_content);
+      return (
+        <div className="source-table-frame">
+          {table ? (
+            <table>
+              <thead>
+                <tr>
+                  {table.headers.map((header, index) => (
+                    <th key={`${header}-${index}`}>{header || `列 ${index + 1}`}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {table.rows.map((row, rowIndex) => (
+                  <tr key={rowIndex}>
+                    {table.headers.map((_, cellIndex) => (
+                      <td key={cellIndex}>{row[cellIndex] ?? ""}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <pre>{block.text_content}</pre>
+          )}
+        </div>
+      );
+    }
+    if (block.block_type === "heading") {
+      const level = Math.min(Math.max(block.heading_level ?? 2, 2), 4);
+      const HeadingTag = `h${level}` as "h2" | "h3" | "h4";
+      return <HeadingTag>{block.text_content}</HeadingTag>;
+    }
+    if (block.block_type === "list") {
+      return <pre className="source-list-text">{block.text_content}</pre>;
+    }
+    return <p>{block.text_content}</p>;
+  }
+
+  function renderSourceSelectionCard(block: DocumentIR["blocks"][number]) {
+    return (
+      <aside
+        className="source-selection-card"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+      >
+        <div>
+          <span>已选原文片段</span>
+          <strong>{sourceBlockExcerpt(block.text_content, 54)}</strong>
+          <p>加入对话后，Agent 会基于这段原文继续回答。</p>
+        </div>
+        <div className="source-selection-actions">
+          <button
+            type="button"
+            disabled={isInteractionLocked || isQaRunning}
+            onClick={() => addBlockToChat(block.block_id)}
+          >
+            加入对话
+          </button>
+        </div>
+      </aside>
+    );
+  }
+
+  function renderSourceAnnotations(annotations: SourceAnnotation[]) {
+    if (annotations.length === 0) return null;
+    return (
+      <div className="source-annotation-list" aria-label="原文标注">
+        {annotations.map((annotation) => {
+          const isQualityIssue = annotation.annotation_type === "quality_issue";
+          const issue = annotation.issue_id
+            ? qualityIssueById.get(annotation.issue_id)
+            : undefined;
+          const qualityCopy = isQualityIssue
+            ? describeQualityIssueForOps({
+                summary: issue?.summary ?? summarizeContent(annotation.content, 42),
+                reason: issue?.why_it_matters ?? summarizeContent(annotation.content, 600),
+                fieldLabel: friendlyFieldLabel(issue?.target_field ?? annotation.field_key),
+                issueType: issue?.issue_type ?? annotation.issue_type,
+                severity: issue?.severity ?? annotation.severity,
+              })
+            : null;
+          return (
+            <article
+              key={annotation.annotation_id}
+              className={`source-annotation-card ${
+                isQualityIssue ? `quality-issue severity-${annotation.severity ?? "medium"}` : ""
+              }`}
+            >
+              <header>
+                <span>{isQualityIssue ? "质量提示" : "专家补充"}</span>
+                <strong>
+                  {isQualityIssue
+                    ? qualityCopy?.headline
+                    : friendlyFieldLabel(annotation.field_key)}
+                </strong>
+                <small>
+                  {Number.isNaN(Date.parse(annotation.updated_at))
+                    ? ""
+                    : new Date(annotation.updated_at).toLocaleString("zh-CN", {
+                        month: "2-digit",
+                        day: "2-digit",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                </small>
+              </header>
+              <p>
+                {isQualityIssue
+                  ? qualityCopy?.description
+                  : summarizeContent(annotation.content, 600)}
+              </p>
+              <footer>
+                {isQualityIssue ? (
+                  <>
+                    <span>{qualityCopy?.priorityLabel}</span>
+                    <button
+                      type="button"
+                      disabled={isInteractionLocked || isQaRunning}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        focusQualityIssueAnnotation(annotation);
+                      }}
+                    >
+                      带问题提问
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    {annotation.candidate_id && (
+                      <span>候选 {annotation.candidate_id.slice(0, 8)}</span>
+                    )}
+                    {annotation.thread_id && (
+                      <span>线程 {annotation.thread_id.slice(0, 8)}</span>
+                    )}
+                  </>
+                )}
+              </footer>
+            </article>
+          );
+        })}
+      </div>
+    );
+  }
+
+  function renderSourceBlock(block: DocumentIR["blocks"][number], index: number) {
+    const linkedFields = blockFieldIndex.get(block.block_id) ?? [];
+    const annotations = sourceAnnotationsByBlockId.get(block.block_id) ?? [];
+    const qualityAnnotations = annotations.filter(
+      (annotation) => annotation.annotation_type === "quality_issue",
+    );
+    const topQualitySeverity = qualityAnnotations.some(
+      (annotation) => annotation.severity === "high",
+    )
+      ? "high"
+      : qualityAnnotations.some((annotation) => annotation.severity === "medium")
+        ? "medium"
+        : qualityAnnotations.length > 0
+          ? "low"
+          : null;
+    const isSelected = selectedBlockId === block.block_id;
+    const isMapped = linkedFields.length > 0;
+    const isInContext = sourceContextBlockIdSet.has(block.block_id);
+    const isNeighbor =
+      selectedBlockId != null &&
+      neighborBlockIds(selectedBlockId).includes(block.block_id) &&
+      !isSelected &&
+      !isInContext;
+    const className = [
+      "block",
+      "source-block",
+      `source-block-${block.block_type}`,
+      isSelected ? "selected is-selected" : "",
+      isMapped ? "mapped is-mapped" : "",
+      isInContext ? "in-context" : "",
+      isNeighbor ? "neighbor-evidence" : "",
+      topQualitySeverity ? "has-quality-issue" : "",
+      topQualitySeverity ? `quality-severity-${topQualitySeverity}` : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    return (
+      <article
+        id={sourceBlockDomId(block.block_id)}
+        key={block.block_id}
+        className={className}
+      >
+        <div
+          className="source-block-hitarea"
+          role="button"
+          tabIndex={isInteractionLocked ? -1 : 0}
+          onClick={() => selectSourceBlock(block.block_id)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              selectSourceBlock(block.block_id);
+            }
+          }}
+        >
+          <div className="source-block-meta">
+            <span>{sourceBlockTypeLabel(block.block_type)}</span>
+            <span>{block.source_span ?? `#${index + 1}`}</span>
+            {isMapped && <span>{linkedFields.length} 个结构化引用</span>}
+            {isInContext && <span>已加入对话</span>}
+            {isNeighbor && <span>相邻证据</span>}
+          </div>
+          <div className="source-block-content">{renderSourceBlockContent(block)}</div>
+          {renderSourceAnnotations(annotations)}
+        </div>
+        {isSelected && renderSourceSelectionCard(block)}
+      </article>
+    );
+  }
+
+  function renderSourceReader() {
+    if (!ir) return null;
+    return (
+      <div className="source-reader" aria-label="来源阅读器">
+        <section className="source-reader-header">
+          <div>
+            <span>来源阅读器</span>
+            <h2>{title || "未命名文档"}</h2>
+            <p>
+              像阅读资料一样浏览原文。点击片段只是选中；点击“加入对话”后才会带入
+              QA 上下文。
+            </p>
+          </div>
+          <div className="source-reader-stats" aria-label="来源统计">
+            <strong>{ir.blocks.length}</strong>
+            <span>原文片段</span>
+            <strong>{sourceMappedBlockCount}</strong>
+            <span>已结构化引用</span>
+            <strong>{activeWorkbenchContext.evidenceBlockIds.length}</strong>
+            <span>已加入对话</span>
+          </div>
+        </section>
+
+        <section className="source-reading-flow" aria-label="原文阅读流">
+          {ir.blocks.map((block, index) => renderSourceBlock(block, index))}
+        </section>
+      </div>
+    );
+  }
+
+  async function refineQuestionForContext(contextSnapshot: QaContext) {
     if (!docId || isInteractionLocked || isQuestionRefining) return;
-    const fieldKey = focusContext.fieldKey ?? activeFieldQuality?.fieldKey;
-    const blockId =
-      focusContext.blockId ?? focusEvidenceBlockIds[0] ?? selectedBlockId;
-    const contextSnapshot = {
-      source: "task" as const,
-      mode: "task_refine_then_qa" as const,
-      blockId: blockId ?? null,
-      targetField: fieldKey,
-      metric: focusContext.metric,
-      evidenceBlockIds: uniqueStrings([...focusEvidenceBlockIds, blockId]),
-      threadId: qaContext.threadId ?? null,
-      questionSeed:
-        focusRecommendedQuestion ||
-        "请结合当前任务和证据原文，给出可写入结构化草稿的专家答案。",
-      gapReason: focusContext.gapMessage ?? activeFieldQuality?.reason ?? null,
-    };
     setQaContext(contextSnapshot);
-    setInput("");
+    setInput(contextSnapshot.questionSeed ?? "");
     const startedAt = Date.now();
     setQuestionRefineProgress({
       status: "running",
@@ -2222,7 +2782,7 @@ export function App() {
           method: "POST",
           body: JSON.stringify({
             block_id: contextSnapshot.blockId,
-            evidence_block_ids: contextSnapshot.evidenceBlockIds,
+            evidence_block_ids: contextSnapshot.evidenceBlockIds ?? [],
             question_seed: contextSnapshot.questionSeed,
             target_field: contextSnapshot.targetField,
             metric: contextSnapshot.metric,
@@ -2244,13 +2804,13 @@ export function App() {
         stepIndex: QUESTION_REFINE_STEPS.length - 1,
         startedAt,
         elapsedMs: Date.now() - startedAt,
-        message: "已生成追问草稿，可编辑后提交",
+        message: questionRefineCompletionMessage(refined.llm_diagnostics),
         contextSummary: refined.context_summary,
         sourceBlockRefs: refined.source_block_refs,
         rationale: refined.rationale,
       });
     } catch (err) {
-      setInput(contextSnapshot.questionSeed);
+      setInput(contextSnapshot.questionSeed ?? "");
       setQuestionRefineProgress({
         status: "error",
         stepIndex: 0,
@@ -2264,6 +2824,30 @@ export function App() {
     } finally {
       window.clearInterval(timer);
     }
+  }
+
+  async function askWithFocus() {
+    if (!docId || isInteractionLocked || isQuestionRefining) return;
+    const fieldKey = focusContext.fieldKey ?? activeFieldKey;
+    const fieldQuality = fieldKey ? fieldQualityByKey.get(fieldKey) : undefined;
+    const blockId = focusContext.blockId ?? focusEvidenceBlockIds[0] ?? null;
+    const evidenceBlockIds = uniqueStrings([...focusEvidenceBlockIds, blockId]);
+    if (!focusRecommendedQuestion && evidenceBlockIds.length === 0 && !fieldKey) {
+      return;
+    }
+    await refineQuestionForContext({
+      source: "task",
+      mode: "task_refine_then_qa",
+      blockId: blockId ?? null,
+      targetField: fieldKey,
+      metric: focusContext.metric,
+      evidenceBlockIds,
+      threadId: qaContext.threadId ?? null,
+      questionSeed:
+        focusRecommendedQuestion ||
+        "请结合当前任务和证据原文，给出可写入结构化草稿的专家答案。",
+      gapReason: focusContext.gapMessage ?? fieldQuality?.reason ?? null,
+    });
   }
 
   async function generateSuggestionsForFocus() {
@@ -2282,13 +2866,14 @@ export function App() {
     );
     setSuggestions((prev) => [...sug.suggestions, ...prev]);
     setPhase("suggestions");
-    setDrawerTab("suggestions");
+    setStudioTab("suggestions");
+    setStudioDrawerOpen(true);
     setMessages((m) => [
       ...m,
       {
         id: crypto.randomUUID(),
         role: "agent",
-        text: `已基于当前证据生成 ${sug.suggestions.length} 条补写建议，可在底部“待确认建议”查看。`,
+        text: `已基于当前证据生成 ${sug.suggestions.length} 条补写建议，可在 Studio“待确认建议”查看。`,
         createdAt: new Date().toISOString(),
       },
     ]);
@@ -2335,7 +2920,7 @@ export function App() {
       setSaveHint(`已回写：${FIELD_LABELS[fieldKey] ?? fieldKey}`);
     } catch (err) {
       setWritebackStatus((s) => ({ ...s, [message.id]: "error" }));
-      setSaveHint(err instanceof Error ? err.message : "回写失败");
+      setSaveHint(writebackErrorMessage(err));
     }
   }
 
@@ -2364,7 +2949,7 @@ export function App() {
       await refreshDoc(docId);
     } catch (err) {
       setCandidateStatus((s) => ({ ...s, [candidate.candidate_id]: "error" }));
-      setSaveHint(err instanceof Error ? err.message : "候选补充确认失败");
+      setSaveHint(writebackErrorMessage(err));
     }
   }
 
@@ -2452,7 +3037,7 @@ export function App() {
         </div>
         <div className="llm-diagnostics">
           {progress.contextSummary ??
-            `证据 ${focusEvidenceBlocks.length} 个 block${
+            `证据 ${visibleFocusEvidenceBlocks.length} 个 block${
               activeFieldQuality ? ` · 目标字段：${activeFieldQuality.label}` : ""
             }`}
         </div>
@@ -2463,10 +3048,10 @@ export function App() {
   function renderQualityProgress(progress: LlmProgress) {
     const title =
       progress.status === "running"
-        ? "质量检测进行中"
+        ? "文档审阅助手正在梳理结构"
         : progress.status === "error"
-          ? "质量检测失败"
-          : "质量检测完成";
+          ? "文档审阅助手需要重试"
+          : "文档审阅助手已整理任务";
 
     return (
       <section
@@ -2475,7 +3060,10 @@ export function App() {
         }`}
       >
         <div className="quality-inline-header">
-          <span className="llm-pulse" />
+          <span className="quality-agent-mark" aria-hidden="true">
+            <span className="llm-pulse" />
+            审
+          </span>
           <div>
             <strong>{title}</strong>
             <p>
@@ -2510,49 +3098,27 @@ export function App() {
           ))}
         </div>
         <div className="llm-diagnostics">
-          {nextRecommendedTask
-            ? `建议下一步：${nextRecommendedTask.title}。`
-            : "全局推荐任务已处理完，接下来可以选择原文中的局部段落继续修订。"}
+          {visibleRecommendedTaskQueue.length > 0
+            ? `已整理 ${visibleRecommendedTaskQueue.length} 个优先补强任务，可进入左侧“对照”区逐项核对证据。`
+            : "接下来可以选择原文中的局部段落，继续让 Agent 辅助问答修订。"}
+          {visibleRecommendedTaskQueue.length > 0 && (
+            <button
+              type="button"
+              className="inline-link-button"
+              disabled={isInteractionLocked}
+              onClick={() => setLeftMode("compare")}
+            >
+              去对照区
+            </button>
+          )}
         </div>
-        {visibleRecommendedTaskQueue.length > 0 && (
-          <div className="quality-task-chips">
-            {visibleRecommendedTaskQueue.map((task) => (
-              <button
-                key={task.id}
-                type="button"
-                className={`task-chip task-${task.status}`}
-                disabled={isInteractionLocked || task.status === "completed"}
-                onClick={() => useRecommendedTask(task)}
-              >
-                <span>{task.status === "completed" ? "已完成" : "待处理"}</span>
-                {task.title}
-              </button>
-            ))}
-            {hiddenRecommendedTaskCount > 0 && (
-              <small className="event-hint">
-                还有 {hiddenRecommendedTaskCount} 个待优化项已收起，可在局部原文中继续处理。
-              </small>
-            )}
-          </div>
-        )}
       </section>
     );
   }
 
-  function renderLlmDebugDrawer() {
-    if (!llmDebugOpen) return null;
+  function renderLlmDebugPanel() {
     return (
-      <aside className="llm-debug-drawer" aria-label="LLM DEBUG 调用信息">
-        <header>
-          <div>
-            <span>DEBUG</span>
-            <strong>LLM 调用详情</strong>
-            <p>仅用于排查：展示发送给模型的 prompts 与调用参数，不包含 API Key。</p>
-          </div>
-          <button type="button" onClick={() => setLlmDebugOpen(false)}>
-            关闭
-          </button>
-        </header>
+      <section className="llm-debug-panel" aria-label="LLM DEBUG 调用信息">
         {llmDebugEntries.length === 0 ? (
           <div className="empty-state compact">
             还没有可查看的 LLM 调用。触发质量检测、问题改写或 QA 后会出现在这里。
@@ -2612,7 +3178,7 @@ export function App() {
             ))}
           </div>
         )}
-      </aside>
+      </section>
     );
   }
 
@@ -2709,15 +3275,9 @@ export function App() {
         </header>
         <p>{stepSummary(step)}</p>
         {step.type === "task_started" && (
-          <div className="event-actions">
-            <button
-              type="button"
-              disabled={isInteractionLocked || isQuestionRefining}
-              onClick={() => void askWithFocus()}
-            >
-              生成追问草稿
-            </button>
-          </div>
+          <small className="event-hint">
+            选择任务后，系统会自动生成可编辑的问题草稿。
+          </small>
         )}
         {step.type === "question_suggested" && (
           <small className="event-hint">问题已放入输入框，可修改后发送。</small>
@@ -2866,7 +3426,7 @@ export function App() {
             disabled={isInteractionLocked}
             onClick={() => void createDoc()}
           >
-            新建文档
+            添加来源
           </button>
           <span style={{ marginLeft: 12, fontWeight: 600 }}>{title}</span>
         </div>
@@ -2989,69 +3549,7 @@ export function App() {
                 </button>
               </div>
 
-              {leftMode === "original" &&
-                ir.blocks.map((b) => (
-                  <div
-                    key={b.block_id}
-                    role="button"
-                    tabIndex={isInteractionLocked ? -1 : 0}
-                    className={`block ${selectedBlockId === b.block_id ? "selected" : ""} ${
-                      blockFieldIndex.has(b.block_id) ? "mapped" : ""
-                    }`}
-                    onClick={() => {
-                      if (!isInteractionLocked) setSelectedBlockId(b.block_id);
-                    }}
-                    onKeyDown={(e) => {
-                      if (
-                        !isInteractionLocked &&
-                        (e.key === "Enter" || e.key === " ")
-                      )
-                        setSelectedBlockId(b.block_id);
-                    }}
-                  >
-                    {selectedBlockId === b.block_id && (
-                      <div
-                        className="block-dialog-anchor"
-                        onClick={(event) => event.stopPropagation()}
-                        onKeyDown={(event) => event.stopPropagation()}
-                      >
-                        <button
-                          type="button"
-                          className="block-add-dialog-button"
-                          disabled={isInteractionLocked || isQaRunning}
-                          onClick={() => addBlockToChat(b.block_id)}
-                        >
-                          添加到对话
-                        </button>
-                      </div>
-                    )}
-                    {b.block_type === "image" && b.media_uri ? (
-                      <img
-                        src={api(b.media_uri)}
-                        alt=""
-                        style={{ maxWidth: "100%", display: "block" }}
-                      />
-                    ) : b.block_type === "table" ? (
-                      <pre
-                        style={{
-                          margin: 0,
-                          whiteSpace: "pre-wrap",
-                          fontFamily: "ui-monospace, monospace",
-                          fontSize: 12,
-                        }}
-                      >
-                        {b.text_content}
-                      </pre>
-                    ) : b.block_type === "heading" ? (
-                      <h3>{b.text_content}</h3>
-                    ) : (
-                      <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>
-                        {b.text_content}
-                      </pre>
-                    )}
-                    <small style={{ color: "var(--muted)" }}>{b.block_type}</small>
-                  </div>
-                ))}
+              {leftMode === "original" && renderSourceReader()}
 
               {leftMode === "structured" && draft && (
                 <div className="field-grid">
@@ -3119,17 +3617,6 @@ export function App() {
                       )}
                     </div>
                     <div className="focus-actions">
-                      <button
-                        type="button"
-                          disabled={
-                            isInteractionLocked ||
-                            isQuestionRefining ||
-                            !focusRecommendedQuestion
-                          }
-                          onClick={() => void askWithFocus()}
-                      >
-                        生成追问草稿
-                      </button>
                       {nextRecommendedTask && !activeFieldQuality && (
                         <button
                           type="button"
@@ -3144,48 +3631,69 @@ export function App() {
 
                   <div className="compare-task-layout">
                     <section className="task-card">
-                      <h3>候选证据</h3>
-                      <p>只展示和当前任务有关的原文 block。点击可作为证据加入问答上下文。</p>
-                      {(focusEvidenceBlocks.length
-                        ? focusEvidenceBlocks
-                        : activeFieldBlocks
-                      ).slice(0, 4).map((block) => (
-                        <button
-                          key={block.block_id}
-                          type="button"
-                          className={`compare-block ${
-                            selectedBlockId === block.block_id ? "selected" : ""
-                          }`}
-                          onClick={() => focusBlock(block.block_id)}
-                        >
-                          <strong>{block.block_type}</strong>
-                          <span>{block.text_content.slice(0, 180)}</span>
-                        </button>
-                      ))}
-                      {focusEvidenceBlocks.length === 0 && activeFieldBlocks.length === 0 && (
-                        <small>暂无候选证据，可先在原文视图选择一个 block。</small>
+                      <div className="task-card-heading">
+                        <span>第 1 步</span>
+                        <h3>可参考的原文依据</h3>
+                        <p>先看这些片段是否能支撑当前任务，再把合适的证据带入右侧问答。</p>
+                      </div>
+                      {compareEvidenceBlocks.map((block) => {
+                        const evidenceCopy = describeEvidenceForOps({
+                          blockType: block.block_type,
+                          blockTypeLabel: sourceBlockTypeLabel(block.block_type),
+                          text: block.text_content,
+                          targetFieldLabel: activeFieldQuality?.label,
+                        });
+                        return (
+                          <button
+                            key={block.block_id}
+                            type="button"
+                            className={`compare-block ops-evidence-card ${
+                              selectedBlockId === block.block_id ? "selected" : ""
+                            }`}
+                            onClick={() => focusBlock(block.block_id)}
+                          >
+                            <span className="ops-card-kicker">
+                              {evidenceCopy.typeLabel}
+                              {block.source_span ? ` · ${block.source_span}` : ""}
+                            </span>
+                            <strong>{evidenceCopy.excerpt}</strong>
+                            <small>{evidenceCopy.usageHint}</small>
+                            <span className="ops-card-action">{evidenceCopy.actionLabel}</span>
+                          </button>
+                        );
+                      })}
+                      {compareEvidenceBlocks.length === 0 && (
+                        <small>暂无可参考原文。可先在原文视图选择片段，再回到对照区处理。</small>
                       )}
                     </section>
 
                     <section className="task-card">
-                      <h3>结构化现状</h3>
+                      <div className="task-card-heading">
+                        <span>第 2 步</span>
+                        <h3>现在草稿里怎么写</h3>
+                        <p>对照当前字段的已有内容和缺口，决定是否让 Agent 生成可写入版本。</p>
+                      </div>
                       {activeFieldQuality ? (
                         <>
-                          <div className={`detail-card field-status-${activeFieldQuality.status}`}>
+                          <div
+                            className={`detail-card ops-structured-summary field-status-${activeFieldQuality.status}`}
+                          >
                             <header>
                               <strong>{activeFieldQuality.label}</strong>
-                              <span>{activeFieldQuality.statusLabel}</span>
+                              <span>{activeFieldOpsCopy?.statusText}</span>
                             </header>
-                            <p>{activeFieldQuality.definition}</p>
+                            <h4>{activeFieldOpsCopy?.headline}</h4>
+                            <p>{activeFieldOpsCopy?.gapSummary}</p>
+                            <small>{activeFieldOpsCopy?.nextStep}</small>
                           </div>
                           {activeFieldQuality.items.length ? (
                             activeFieldQuality.items.slice(0, 3).map((item, index) => (
                               <div
                                 key={`${activeFieldQuality.fieldKey}-${index}`}
-                                className="linked-field-card"
+                                className="linked-field-card ops-current-content"
                               >
                                 <header>
-                                  <strong>条目 {index + 1}</strong>
+                                  <strong>已有内容 {index + 1}</strong>
                                   <span>{item.status ?? "Drafted"}</span>
                                 </header>
                                 <p>{summarizeContent(item.content)}</p>
@@ -3193,7 +3701,7 @@ export function App() {
                             ))
                           ) : (
                             <div className="empty-state compact">
-                              该字段暂无内容，建议直接通过问答补齐。
+                              这个字段还缺可直接采用的运营知识。建议先确认左侧原文依据，再通过右侧问答生成补充内容。
                             </div>
                           )}
                         </>
@@ -3236,59 +3744,52 @@ export function App() {
         />
 
         <section className="pane collaboration-pane">
-          <div className="context-bar workbench-bar">
-            <div className="focus-task-header">
-              <span>任务工作台</span>
-              <strong>{taskQueueSummary}</strong>
-            </div>
-            <p>
-              {activeFieldQuality
-                ? `已选中“${activeFieldQuality.label}”，可以生成追问草稿或补写建议。`
-                : focusEvidenceBlocks.length > 0
-                  ? `已选择 ${focusEvidenceBlocks.length} 个原文证据，可直接带上下文提问。`
-                  : "先从对照区选择推荐任务，或在原文中点选局部 block。"}
-            </p>
-            {nextRecommendedTask ? (
+          <div
+            className={`context-bar workbench-bar ${
+              workbenchCollapsed ? "collapsed" : ""
+            }`}
+          >
+            <div className="workbench-compact-header">
+              <div className="workbench-title-block">
+                <span>当前上下文</span>
+                <strong>{workbenchContextSummary}</strong>
+              </div>
+              <div className="workbench-compact-meta" aria-label="任务工作台摘要">
+                <span>证据 {visibleFocusEvidenceBlocks.length}</span>
+                {activeFieldQuality && <span>{activeFieldQuality.label}</span>}
+              </div>
               <button
                 type="button"
-                className="recommended-question"
-                disabled={isInteractionLocked || nextRecommendedTask.status === "completed"}
-                onClick={() => useRecommendedTask(nextRecommendedTask)}
-              >
-                建议下一步：{nextRecommendedTask.title}
-              </button>
-            ) : (
-              <small className="event-hint">
-                全局任务完成后，请回到原文选择局部段落继续问答修订。
-              </small>
-            )}
-            <div className="focus-actions">
-              <button
-                type="button"
+                className="workbench-clear"
                 disabled={
                   isInteractionLocked ||
-                  isQuestionRefining ||
-                  !focusRecommendedQuestion
+                  (activeWorkbenchContext.source === "none" &&
+                    visibleFocusEvidenceBlocks.length === 0)
                 }
-                onClick={() => void askWithFocus()}
+                onClick={clearQaContext}
               >
-                生成追问草稿
+                清除上下文
               </button>
               <button
                 type="button"
-                disabled={isInteractionLocked || focusEvidenceBlocks.length === 0}
-                onClick={() => void generateSuggestionsForFocus()}
+                className="workbench-toggle"
+                aria-expanded={!workbenchCollapsed}
+                onClick={() => setWorkbenchCollapsed((collapsed) => !collapsed)}
               >
-                生成补写建议
-              </button>
-              <button
-                type="button"
-                disabled={isInteractionLocked}
-                onClick={() => setLeftMode("compare")}
-              >
-                查看任务队列
+                {workbenchCollapsed ? "展开" : "收起"}
               </button>
             </div>
+            {!workbenchCollapsed && (
+              <div className="workbench-body">
+                <p>
+                  {activeFieldQuality
+                    ? `已选中“${activeFieldQuality.label}”，对话会携带当前字段和证据上下文。`
+                    : visibleFocusEvidenceBlocks.length > 0
+                      ? `已选择 ${visibleFocusEvidenceBlocks.length} 个原文证据，可直接带上下文提问。`
+                      : "先从对照区选择推荐任务，或在原文中点选局部 block。"}
+                </p>
+              </div>
+            )}
           </div>
 
           <div
@@ -3316,13 +3817,13 @@ export function App() {
 
           <div
             className={`composer-input-shell ${
-              activeFieldQuality || focusEvidenceBlocks.length > 0
+              activeFieldQuality || visibleFocusEvidenceBlocks.length > 0
                 ? "has-context"
                 : ""
             }`}
             onClick={() => chatInputRef.current?.focus()}
           >
-            {(activeFieldQuality || focusEvidenceBlocks.length > 0) && (
+            {(activeFieldQuality || visibleFocusEvidenceBlocks.length > 0) && (
               <div className="composer-inline-context" aria-label="已加入对话上下文">
                 <span className="composer-inline-label">已加入对话上下文</span>
                 <span className="context-mode-chip">
@@ -3334,6 +3835,9 @@ export function App() {
                 {focusContext.gapMessage && qaContext.mode !== "direct_qa" && (
                   <span>缺口：{focusContext.gapMessage}</span>
                 )}
+                {qaContext.source === "quality_issue" && focusContext.gapMessage && (
+                  <span>当前问题：{focusContext.gapMessage}</span>
+                )}
                 {focusRecommendedQuestion && qaContext.mode !== "direct_qa" && (
                   <button
                     type="button"
@@ -3343,7 +3847,7 @@ export function App() {
                     推荐追问：{focusRecommendedQuestion}
                   </button>
                 )}
-                {focusEvidenceBlocks.map((block) => (
+                {visibleFocusEvidenceBlocks.map((block) => (
                   <span key={block.block_id} className="context-evidence-chip">
                     <button
                       type="button"
@@ -3390,38 +3894,38 @@ export function App() {
               ? "正在生成追问草稿..."
               : isQaRunning
               ? "QA 思考中..."
-              : activeFieldQuality || focusEvidenceBlocks.length
+              : activeFieldQuality || visibleFocusEvidenceBlocks.length
                 ? "带上下文提问"
                 : "发送"}
-          </button>
-          <button
-            type="button"
-            className="llm-debug-toggle"
-            disabled={llmDebugEntries.length === 0}
-            onClick={() => setLlmDebugOpen((v) => !v)}
-          >
-            DEBUG · LLM 调用 {llmDebugEntries.length}
           </button>
         </section>
       </div>
 
-      {renderLlmDebugDrawer()}
+      <button
+        type="button"
+        className="studio-drawer-toggle"
+        aria-expanded={studioDrawerOpen}
+        onClick={() => setStudioDrawerOpen((open) => !open)}
+      >
+        Studio
+        {llmDebugEntries.length > 0 && (
+          <span className="studio-drawer-badge">{llmDebugEntries.length}</span>
+        )}
+      </button>
 
-      <div
-        className="drawer-resizer"
-        role="separator"
-        aria-label="调整底栏高度"
-        aria-orientation="horizontal"
-        aria-valuemin={140}
-        aria-valuemax={Math.round(Math.min(520, window.innerHeight * 0.55))}
-        aria-valuenow={Math.round(bottomDrawerHeight)}
-        tabIndex={0}
-        onPointerDown={startDrawerResize}
-        onKeyDown={handleDrawerResizerKeyDown}
-      />
-
-      <footer className="drawer">
-        <div className="drawer-tabs">
+      {studioDrawerOpen && (
+        <aside className="studio-drawer" aria-label="Studio 辅助信息">
+          <header className="studio-drawer-header">
+            <div>
+              <span>Studio</span>
+              <strong>辅助信息</strong>
+              <p>低频查看区：建议、版本、字段变化、任务指标、操作日志和 LLM DEBUG。</p>
+            </div>
+            <button type="button" onClick={() => setStudioDrawerOpen(false)}>
+              关闭
+            </button>
+          </header>
+          <div className="studio-drawer-tabs">
           {(
             [
               ["suggestions", "待确认建议"],
@@ -3429,21 +3933,22 @@ export function App() {
               ["fields", "结构字段变化"],
               ["eval", "任务与问题"],
               ["audit", "操作日志"],
+              ["debug", "LLM DEBUG"],
             ] as const
           ).map(([id, label]) => (
             <button
               key={id}
               type="button"
               disabled={isInteractionLocked}
-              className={drawerTab === id ? "active" : ""}
-              onClick={() => setDrawerTab(id)}
+              className={studioTab === id ? "active" : ""}
+              onClick={() => setStudioTab(id)}
             >
               {label}
             </button>
           ))}
         </div>
-        <div className="drawer-body">
-          {drawerTab === "suggestions" && (
+        <div className="studio-drawer-body">
+          {studioTab === "suggestions" && (
             <ul>
               {suggestions.map((s) => (
                 <li key={s.suggestion_id}>
@@ -3453,7 +3958,7 @@ export function App() {
               {suggestions.length === 0 && <li>暂无待确认建议</li>}
             </ul>
           )}
-          {drawerTab === "diff" && (
+          {studioTab === "diff" && (
             <div className="version-panel">
               <div className="version-actions">
                 <button
@@ -3497,14 +4002,14 @@ export function App() {
               )}
             </div>
           )}
-          {drawerTab === "fields" && (
+          {studioTab === "fields" && (
             <pre style={{ fontSize: 12 }}>
               {draft
                 ? JSON.stringify(draft.confidence_by_field, null, 2)
                 : "—"}
             </pre>
           )}
-          {drawerTab === "eval" && (
+          {studioTab === "eval" && (
             <div style={{ fontSize: 13 }}>
               <p>
                 <strong>状态</strong>{" "}
@@ -3597,17 +4102,32 @@ export function App() {
               </div>
             </div>
           )}
-          {drawerTab === "audit" && (
-            <ul>
-              {(meta?.audit ?? []).slice(-12).map((a, i) => (
-                <li key={i}>
-                  {a.at} — {a.action} {a.detail ?? ""}
-                </li>
-              ))}
-            </ul>
+          {studioTab === "audit" && (
+            <section className="studio-audit-panel">
+              <h3>操作日志</h3>
+              <ul>
+                {(meta?.audit ?? []).slice(-12).map((a, i) => (
+                  <li key={i}>
+                    {a.at} — {a.action} {a.detail ?? ""}
+                  </li>
+                ))}
+                {(meta?.audit ?? []).length === 0 && <li>暂无操作日志</li>}
+              </ul>
+            </section>
+          )}
+          {studioTab === "debug" && (
+            <>
+              <div className="llm-debug-intro">
+                <span>DEBUG</span>
+                <strong>LLM 调用详情</strong>
+                <p>仅用于排查：展示发送给模型的 prompts 与调用参数，不包含 API Key。</p>
+              </div>
+              {renderLlmDebugPanel()}
+            </>
           )}
         </div>
-      </footer>
+        </aside>
+      )}
     </div>
   );
 }

@@ -6,7 +6,10 @@ import type {
   ExpertMemory,
   ExpertNote,
   GTCandidate,
+  GlobalQualityTriage,
   GroundTruthDraft,
+  QualityIssueIndex,
+  SourceAnnotation,
   SuggestionRecord,
   TaskThread,
   ThreadStep,
@@ -16,6 +19,9 @@ import {
   ExpertMemorySchema,
   ExpertNoteSchema,
   GTCandidateSchema,
+  GlobalQualityTriageSchema,
+  QualityIssueIndexSchema,
+  SourceAnnotationSchema,
   TaskThreadSchema,
   ThreadStepSchema,
 } from "@ebs/ground-truth-schema";
@@ -87,6 +93,53 @@ export class FileStore {
   readDraft(docId: string, versionId: string): GroundTruthDraft {
     const p = join(this.versionDir(docId, versionId), "draft.json");
     return JSON.parse(readFileSync(p, "utf8")) as GroundTruthDraft;
+  }
+
+  writeGlobalQualityTriage(
+    docId: string,
+    versionId: string,
+    triage: GlobalQualityTriage,
+  ) {
+    const dir = this.versionDir(docId, versionId);
+    ensureDir(dir);
+    const checked = GlobalQualityTriageSchema.parse(triage);
+    writeFileSync(join(dir, "global_quality_triage.json"), JSON.stringify(checked, null, 2));
+  }
+
+  readGlobalQualityTriage(
+    docId: string,
+    versionId: string,
+  ): GlobalQualityTriage | null {
+    const p = join(this.versionDir(docId, versionId), "global_quality_triage.json");
+    try {
+      return GlobalQualityTriageSchema.parse(JSON.parse(readFileSync(p, "utf8")));
+    } catch {
+      return null;
+    }
+  }
+
+  writeQualityIssueIndex(
+    docId: string,
+    versionId: string,
+    issueIndex: QualityIssueIndex,
+  ) {
+    const dir = this.versionDir(docId, versionId);
+    ensureDir(dir);
+    const checked = QualityIssueIndexSchema.parse({
+      ...issueIndex,
+      doc_id: docId,
+      version_id: versionId,
+    });
+    writeFileSync(join(dir, "quality_issue_index.json"), JSON.stringify(checked, null, 2));
+  }
+
+  readQualityIssueIndex(docId: string, versionId: string): QualityIssueIndex | null {
+    const p = join(this.versionDir(docId, versionId), "quality_issue_index.json");
+    try {
+      return QualityIssueIndexSchema.parse(JSON.parse(readFileSync(p, "utf8")));
+    } catch {
+      return null;
+    }
   }
 
   appendSuggestion(docId: string, s: SuggestionRecord) {
@@ -200,6 +253,44 @@ export class FileStore {
     if (idx >= 0) list[idx] = checked;
     else list.push(checked);
     writeFileSync(join(dir, "expert_notes.json"), JSON.stringify(list, null, 2));
+  }
+
+  listSourceAnnotations(docId: string, versionId: string): SourceAnnotation[] {
+    const p = join(this.versionDir(docId, versionId), "source_annotations.json");
+    try {
+      const raw = JSON.parse(readFileSync(p, "utf8")) as unknown[];
+      return raw
+        .map((annotation) => SourceAnnotationSchema.parse(annotation))
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    } catch {
+      return [];
+    }
+  }
+
+  upsertSourceAnnotation(docId: string, annotation: SourceAnnotation) {
+    const checked = SourceAnnotationSchema.parse(annotation);
+    const dir = this.versionDir(docId, checked.version_id);
+    ensureDir(dir);
+    const list = this.listSourceAnnotations(docId, checked.version_id);
+    const idx = list.findIndex(
+      (item) => item.annotation_id === checked.annotation_id,
+    );
+    if (idx >= 0) list[idx] = checked;
+    else list.push(checked);
+    writeFileSync(join(dir, "source_annotations.json"), JSON.stringify(list, null, 2));
+  }
+
+  copySourceAnnotations(docId: string, fromVersionId: string, toVersionId: string) {
+    const now = new Date().toISOString();
+    for (const annotation of this.listSourceAnnotations(docId, fromVersionId)) {
+      this.upsertSourceAnnotation(docId, {
+        ...annotation,
+        annotation_id: `${annotation.annotation_id}-copy-${toVersionId}`,
+        version_id: toVersionId,
+        created_at: now,
+        updated_at: now,
+      });
+    }
   }
 
   saveImmutableUpload(docId: string, fileId: string, filename: string, buf: Buffer) {

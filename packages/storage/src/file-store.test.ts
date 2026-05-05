@@ -103,4 +103,75 @@ describe("FileStore expert memory and versions", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("persists global quality triage, quality issues and source annotation projections", () => {
+    const root = mkdtempSync(join(tmpdir(), "ebs-store-"));
+    try {
+      const store = new FileStore(root);
+      store.writeGlobalQualityTriage("doc-1", "v1", {
+        summary: "文档缺少判断标准。",
+        major_gaps: [],
+        recommended_tasks: [
+          {
+            title: "补充判断标准",
+            reason: "当前 block 只有动作，没有判断口径。",
+            question: "这里的异常判断标准是什么？",
+            target_field: "judgment_criteria",
+            source_block_ids: ["b4"],
+            priority: "high",
+          },
+        ],
+        suggested_questions: [],
+        source_refs: [{ block_id: "b2" }],
+      });
+      store.writeQualityIssueIndex("doc-1", "v1", {
+        doc_id: "doc-1",
+        version_id: "v1",
+        generated_at: "2026-05-02T07:00:00.000Z",
+        global_context_summary: "文档缺少判断标准。",
+        issues: [
+          {
+            issue_id: "issue-criteria",
+            severity: "high",
+            issue_type: "missing_judgment_criteria",
+            summary: "缺少判断正常或异常的标准。",
+            primary_block_ids: ["b4"],
+            supporting_block_ids: ["b2"],
+            target_field: "judgment_criteria",
+            recommended_question: "这里的异常判断标准是什么？",
+            confidence: 0.82,
+          },
+        ],
+      });
+      store.upsertSourceAnnotation("doc-1", {
+        annotation_id: "annotation-issue",
+        doc_id: "doc-1",
+        version_id: "v1",
+        block_id: "b4",
+        field_key: "judgment_criteria",
+        content: "缺少判断正常或异常的标准。",
+        annotation_type: "quality_issue",
+        issue_id: "issue-criteria",
+        severity: "high",
+        issue_type: "missing_judgment_criteria",
+        block_role: "primary",
+        recommended_question: "这里的异常判断标准是什么？",
+        created_at: "2026-05-02T07:00:00.000Z",
+        updated_at: "2026-05-02T07:00:00.000Z",
+      });
+
+      expect(
+        store.readGlobalQualityTriage("doc-1", "v1")?.recommended_tasks[0]
+          ?.source_block_ids,
+      ).toEqual(["b4"]);
+      expect(store.readQualityIssueIndex("doc-1", "v1")?.issues[0]?.issue_id).toBe(
+        "issue-criteria",
+      );
+      expect(store.listSourceAnnotations("doc-1", "v1")[0]?.annotation_type).toBe(
+        "quality_issue",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

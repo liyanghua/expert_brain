@@ -211,6 +211,112 @@ describe("runDocQAAsync", () => {
         }),
       }),
     );
+    expect(refined.llm_diagnostics?.system_prompt).toContain(
+      "参考字段话术的提问角度",
+    );
+    expect(refined.llm_diagnostics?.user_prompt).toContain(
+      '"question_guidance_examples"',
+    );
+    expect(refined.llm_diagnostics?.user_prompt).toContain("您通常通过哪些核心指标");
+  });
+
+  it("uses expert interview phrasing in local question refinement fallback", async () => {
+    process.env.EBS_LLM_QA = "0";
+    const draft = emptyGroundTruthDraft("doc-qa", "v1");
+
+    const refined = await runQuestionRefinementAsync({
+      ir,
+      draft,
+      blockId: "b1",
+      evidenceBlockIds: ["b1"],
+      questionSeed: "请补充执行步骤",
+      gapReason: "缺少具体操作顺序",
+      targetField: "execution_steps",
+    });
+
+    expect(refined.refined_question).toContain("老师");
+    expect(refined.refined_question).toContain("能不能请您按照实际操作顺序");
+    expect(refined.refined_question).toContain("缺少具体操作顺序");
+    expect(refined.source_block_refs).toEqual(["b1"]);
+  });
+
+  it("uses DashScope fallback when question refinement JSON is truncated", async () => {
+    process.env.DASHSCOPE_API_KEY = "dashscope-key";
+    process.env.DASHSCOPE_MODEL = "qwen-plus";
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText
+      .mockResolvedValueOnce(
+        '{"refined_question":"请补充判断依据","context_summary":"文档指出成长期需稳',
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          refined_question: "备用模型：请说明点击率下降时的判断依据是什么？",
+          context_summary: "商品点击率下降，转化率持平。",
+          source_block_refs: ["b1", "b2"],
+          rationale: "主模型 JSON 截断后使用 DashScope 兜底。",
+        }),
+      );
+    const draft = emptyGroundTruthDraft("doc-qa", "v1");
+
+    const refined = await runQuestionRefinementAsync({
+      ir,
+      draft,
+      blockId: "b1",
+      evidenceBlockIds: ["b1", "b2"],
+      questionSeed: "请结合指标表判断点击率下降原因。",
+      gapReason: "缺少判断依据",
+      targetField: "judgment_basis",
+    });
+
+    expect(mockedChatCompletionText).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        provider: "dashscope",
+        label: "qa.refine_question.fallback_dashscope",
+      }),
+    );
+    expect(refined.refined_question).toBe(
+      "备用模型：请说明点击率下降时的判断依据是什么？",
+    );
+    expect(refined.llm_diagnostics).toEqual(
+      expect.objectContaining({
+        label: "qa.refine_question.fallback_dashscope",
+        provider: "dashscope",
+        model: "qwen-plus",
+        status: "ok",
+      }),
+    );
+  });
+
+  it("keeps a local question draft when primary and fallback refinement fail", async () => {
+    process.env.DASHSCOPE_API_KEY = "dashscope-key";
+    process.env.DASHSCOPE_MODEL = "qwen-plus";
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText
+      .mockRejectedValueOnce(new Error("LLM returned empty message content"))
+      .mockRejectedValueOnce(new Error("TimeoutError: fallback timed out"));
+    const draft = emptyGroundTruthDraft("doc-qa", "v1");
+
+    const refined = await runQuestionRefinementAsync({
+      ir,
+      draft,
+      blockId: "b1",
+      evidenceBlockIds: ["b1", "b2"],
+      questionSeed: "请结合指标表判断点击率下降原因。",
+      gapReason: "缺少判断依据",
+      targetField: "judgment_basis",
+    });
+
+    expect(refined.refined_question).toContain("请结合指标表判断点击率下降原因");
+    expect(refined.refined_question).toContain("判断依据");
+    expect(refined.llm_diagnostics).toEqual(
+      expect.objectContaining({
+        label: "qa.refine_question.fallback_dashscope",
+        provider: "dashscope",
+        status: "failed",
+        reason: "timeout",
+      }),
+    );
   });
 
   it("sends only selected local evidence blocks to QA answer", async () => {
@@ -240,6 +346,9 @@ describe("runDocQAAsync", () => {
     const call = mockedChatCompletionText.mock.calls[0]?.[0];
     expect(call?.label).toBe("qa.answer");
     expect(call?.system).toContain("direct_qa");
+    expect(call?.system).toContain("business_scenario");
+    expect(call?.system).toContain("judgment_basis");
+    expect(call?.system).toContain("tool_templates");
     expect(call?.user).toContain('"qa_mode": "direct_qa"');
     expect(call?.user).toContain('"evidence_blocks"');
     expect(call?.user).toContain('"block_id": "b1"');
@@ -275,6 +384,71 @@ describe("runDocQAAsync", () => {
       expect.objectContaining({
         label: "qa.answer",
         status: "ok",
+      }),
+    );
+  });
+
+  it("normalizes invalid writeback field keys without marking QA failed", async () => {
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText.mockResolvedValueOnce(
+      JSON.stringify({
+        refined_question: "企业元策略的定义是什么？",
+        direct_answer: "企业元策略是统一、可复用的策略框架。",
+        rationale: "模型返回了不在 schema 内的 definitions 字段。",
+        source_block_refs: ["b1"],
+        target_field: "definitions",
+        suggested_writeback: {
+          field_key: "definitions",
+          content: "企业元策略：统一、可复用的策略框架。",
+        },
+      }),
+    );
+    const draft = emptyGroundTruthDraft("doc-qa", "v1");
+
+    const qa = await runDocQAAsync({
+      ir,
+      draft,
+      blockId: "b1",
+      question: "企业元策略是什么？",
+      targetField: "judgment_basis",
+    });
+
+    expect(qa.llm_diagnostics).toEqual(
+      expect.objectContaining({
+        label: "qa.answer",
+        status: "ok",
+      }),
+    );
+    expect(qa.target_field).toBe("judgment_basis");
+    expect(qa.suggested_writeback).toEqual(
+      expect.objectContaining({
+        field_key: "judgment_basis",
+        content: "企业元策略：统一、可复用的策略框架。",
+      }),
+    );
+  });
+
+  it("reports json_parse_error when QA answer JSON is truncated", async () => {
+    const mockedChatCompletionText = vi.mocked(chatCompletionText);
+    mockedChatCompletionText.mockResolvedValueOnce(
+      '{"refined_question":"企业元策略是什么？","direct_answer":"企业元策略是统一框架","rationale":"证据充足","source_block_refs":["b1"],"suggested_writeback":{"field_key":"judgment_basis","content":"企业元策略',
+    );
+    const draft = emptyGroundTruthDraft("doc-qa", "v1");
+
+    const qa = await runDocQAAsync({
+      ir,
+      draft,
+      blockId: "b1",
+      question: "企业元策略是什么？",
+      targetField: "judgment_basis",
+    });
+
+    expect(qa.direct_answer).toContain("企业元策略是什么");
+    expect(qa.llm_diagnostics).toEqual(
+      expect.objectContaining({
+        label: "qa.answer",
+        status: "failed",
+        reason: "json_parse_error",
       }),
     );
   });

@@ -1,0 +1,833 @@
+agent_mode_pipeline:
+  name: document_optimization_agent_mode
+  version: v1
+  goal: >
+    将业务场景文档通过“解析 → 理解 → 结构化抽取 → 评分 → 计划 → 专家确认 → 分步补强 →
+    重抽取重评分 → 专家复核”的闭环，持续优化为高质量业务文档，并为后续 Agent Strategy 编译做准备。
+
+  global_principles:
+    - 所有步骤必须有标准输入输出
+    - 所有步骤必须可观测
+    - 所有步骤必须可评估
+    - 所有核心步骤必须可替换工具
+    - 所有推断内容必须显式标记 inferred_candidate
+    - 不允许直接覆盖 raw source
+    - 评分结果必须驱动后续补强动作
+    - 最终质量必须用机器指标 + 专家评分双重验证
+
+  shared_ids:
+    run_id: string
+    document_id: string
+    base_version_id: string
+    target_version_id: string
+    scene_id: string
+    schema_profile_version: string
+    expert_guidance_profile_version: string
+    evaluation_profile_version: string
+
+  shared_objects:
+    document_ir: DocumentIR
+    document_understanding: DocumentUnderstanding
+    structured_draft: BusinessDocStructuredDraft
+    extraction_scorecard: ExtractionScorecard
+    agent_plan: AgentPlan
+    expert_review: ExpertReview
+    artifacts_registry: ArtifactRegistry
+    observability_context:
+      trace_id: string
+      span_id: string
+      step_id: string
+
+  recommended_stack:
+    orchestration:
+      primary:
+        - langgraph
+      alternatives:
+        - custom_state_machine
+    observability:
+      baseline:
+        - opentelemetry
+      llm_tracing:
+        - langfuse
+        - phoenix
+    agent_runtime_style:
+      primary:
+        - hermes_style_runtime
+      alternatives:
+        - custom_runtime
+    storage:
+      database:
+        - postgresql
+      object_store:
+        - s3_or_minio
+      cache_queue:
+        - redis
+
+  steps:
+
+    - step_id: step_0_scene_registration
+      name: 场景注册与配置注入
+      purpose: >
+        为当前文档绑定业务场景、schema、专家提示词与评估规则，使后续抽取和优化具有场景意识。
+      inputs:
+        - raw_document
+        - selected_scene
+        - optional_user_notes
+      outputs:
+        - scene_binding
+        - schema_profile
+        - expert_guidance_profile
+        - evaluation_profile
+      actions:
+        - 加载 scene 对应 schema_profile
+        - 加载 scene 对应 expert_guidance_profile
+        - 加载 scene 对应 evaluation_profile
+        - 记录 profile 版本
+      open_source_candidates:
+        direct_tools:
+          - name: hyper_extract
+            role: 借鉴 template-first / strongly-typed extraction 思路
+            type: design_reference
+            replaceable: true
+        self_built:
+          - scene_registry
+          - profile_loader
+          - config_store
+      evaluation:
+        metrics:
+          - name: scene_match_accuracy
+            definition: 选择或识别的 scene 与文档真实业务场景的一致程度
+          - name: profile_load_success_rate
+            definition: schema/guidance/eval profile 成功加载比例
+          - name: wrong_profile_rate
+            definition: 错绑 profile 的比例
+        thresholds:
+          scene_match_accuracy:
+            target: 0.95
+            minimum: 0.90
+          profile_load_success_rate:
+            target: 1.0
+            minimum: 0.99
+          wrong_profile_rate:
+            target_max: 0.02
+            hard_max: 0.05
+      observability:
+        traces:
+          - scene_profile_load
+        metrics:
+          - profile_load_duration_ms
+          - profile_load_success
+        logs:
+          - scene_id
+          - schema_profile_version
+          - expert_guidance_profile_version
+          - evaluation_profile_version
+        artifacts:
+          - scene_binding.json
+
+    - step_id: step_1_parse_normalize
+      name: 文档解析与标准化
+      purpose: >
+        将原始文档转换为高保真的 Document IR，为后续长文档理解、结构化抽取和块级交互提供统一基础。
+      inputs:
+        - raw_document
+        - scene_binding
+      outputs:
+        - document_ir
+      actions:
+        - 文件类型识别
+        - 选择 parser adapter
+        - 保留 heading hierarchy
+        - 保留 table/image/caption
+        - 生成 block-level source refs
+      open_source_candidates:
+        primary:
+          - name: docling
+            role: 多格式解析与统一文档表示
+            type: parser
+            replaceable: true
+          - name: marker
+            role: 文档转 markdown/json/chunks/html
+            type: parser
+            replaceable: true
+        optional:
+          - name: mineru
+            role: Office-heavy / 图文混排复杂文档解析
+            type: parser
+            replaceable: true
+      evaluation:
+        metrics:
+          - name: parse_success_rate
+            definition: 文档成功解析为 Document IR 的比例
+          - name: block_integrity_rate
+            definition: block 切分是否完整保留语义单元
+          - name: heading_preservation_rate
+            definition: 标题层级保真度
+          - name: table_preservation_rate
+            definition: 表格结构保真度
+          - name: source_span_completeness
+            definition: block 是否完整携带 source span
+        thresholds:
+          parse_success_rate:
+            target: 0.99
+            minimum: 0.95
+          block_integrity_rate:
+            target: 0.92
+            minimum: 0.85
+          heading_preservation_rate:
+            target: 0.95
+            minimum: 0.90
+          table_preservation_rate:
+            target: 0.90
+            minimum: 0.80
+          source_span_completeness:
+            target: 0.98
+            minimum: 0.90
+      observability:
+        traces:
+          - parse_document
+          - build_document_ir
+        metrics:
+          - parse_duration_ms
+          - block_count
+          - heading_count
+          - table_count
+          - image_count
+        logs:
+          - parser_name
+          - parser_version
+          - warnings
+          - input_file_type
+        artifacts:
+          - document_ir.json
+
+    - step_id: step_2_hierarchical_understanding
+      name: 层级化文档理解
+      purpose: >
+        解决长文档直接压缩带来的信息丢失，通过 section summaries 和 document understanding 构建稳定的全局理解层。
+      inputs:
+        - document_ir
+        - schema_profile
+        - expert_guidance_profile
+      outputs:
+        - section_summaries
+        - document_understanding
+      actions:
+        - 构建 section tree
+        - 生成 section summaries
+        - 聚合 document theme / goal / key signals / likely gaps
+      open_source_candidates:
+        primary:
+          - name: raptor_like_strategy
+            role: 层级化摘要 / 树状理解
+            type: algorithmic_pattern
+            replaceable: true
+          - name: contextual_retrieval_style
+            role: 上下文化 chunk / section 理解
+            type: retrieval_pattern
+            replaceable: true
+        optional:
+          - name: graphrag_hierarchy
+            role: 社区层级摘要 / 关系增强
+            type: graph_summary_pattern
+            replaceable: true
+      evaluation:
+        metrics:
+          - name: section_summary_coverage
+            definition: 文档 section 是否都被正确概括
+          - name: summary_faithfulness
+            definition: 摘要是否忠实于原文
+          - name: summary_grounding_rate
+            definition: 摘要是否有可靠来源
+          - name: theme_goal_accuracy
+            definition: document theme / goal 是否正确
+          - name: summary_compression_ratio
+            definition: 压缩比是否在合理范围且不损失关键信息
+        thresholds:
+          section_summary_coverage:
+            target: 0.95
+            minimum: 0.85
+          summary_faithfulness:
+            target: 0.90
+            minimum: 0.80
+          summary_grounding_rate:
+            target: 0.90
+            minimum: 0.80
+          theme_goal_accuracy:
+            target: 0.88
+            minimum: 0.75
+      observability:
+        traces:
+          - build_section_tree
+          - summarize_sections
+          - synthesize_document_understanding
+        metrics:
+          - section_count
+          - summary_duration_ms
+          - summary_token_usage
+        logs:
+          - low_confidence_sections
+          - likely_gap_hints
+        artifacts:
+          - section_summaries.json
+          - document_understanding.json
+
+    - step_id: step_3_structured_extraction
+      name: 结构化抽取
+      purpose: >
+        根据 BusinessDocStructuredDraft schema，将文档理解结果与原文块映射为结构化业务文档草稿。
+      inputs:
+        - document_ir
+        - document_understanding
+        - schema_profile
+        - expert_guidance_profile
+      outputs:
+        - structured_draft_v0
+        - gap_candidates
+      actions:
+        - 先抽 document-level fields
+        - 再抽 section/list fields
+        - 最后抽 inferred_candidate fields
+        - 为字段和条目绑定 source refs
+        - 标记 field_status
+      open_source_candidates:
+        primary:
+          - name: hyper_extract_style_templates
+            role: 模板化、强类型抽取思路
+            type: extraction_pattern
+            replaceable: true
+          - name: marker_structured_extraction
+            role: schema-guided structured extraction baseline
+            type: extraction_baseline
+            replaceable: true
+        alternatives:
+          - name: prompt_only_extractor
+            role: 纯 prompt 基线
+            type: baseline
+            replaceable: true
+      evaluation:
+        metrics:
+          - name: field_coverage
+            definition: 非空字段数 / 目标字段总数
+          - name: field_accuracy
+            definition: 字段语义正确率
+          - name: item_f1
+            definition: 列表型字段条目级 F1
+          - name: source_grounding_rate
+            definition: 字段/条目来源绑定正确率
+          - name: structural_consistency
+            definition: 字段间逻辑一致性
+          - name: gap_detection_accuracy
+            definition: 缺口识别 F1
+          - name: inference_handling_accuracy
+            definition: 推断字段处理规范度
+        thresholds:
+          field_coverage:
+            target: 0.80
+            minimum: 0.70
+          field_accuracy:
+            target: 0.85
+            minimum: 0.75
+          item_f1:
+            target: 0.80
+            minimum: 0.70
+          source_grounding_rate:
+            target: 0.90
+            minimum: 0.80
+          structural_consistency:
+            target: 0.90
+            minimum: 0.80
+          gap_detection_accuracy:
+            target: 0.80
+            minimum: 0.70
+          inference_handling_accuracy:
+            target: 0.90
+            minimum: 0.85
+      observability:
+        traces:
+          - extract_document_level_fields
+          - extract_section_fields
+          - extract_inferred_fields
+          - bind_source_refs
+        metrics:
+          - extraction_duration_ms
+          - non_empty_field_count
+          - inferred_field_count
+          - gap_count
+        logs:
+          - extraction_method
+          - low_confidence_fields
+          - missing_required_fields
+        artifacts:
+          - structured_draft.v0.json
+          - gap_candidates.json
+
+    - step_id: step_4_initial_scoring
+      name: 初始评分
+      purpose: >
+        对当前结构化结果生成统一评分卡，为后续优化计划提供依据。
+      inputs:
+        - structured_draft_v0
+        - schema_profile
+        - evaluation_profile
+      outputs:
+        - extraction_scorecard_v0
+      actions:
+        - 计算 8 项核心指标
+        - 标记低于阈值的指标
+        - 生成字段级 / 条目级诊断
+      open_source_candidates:
+        primary:
+          - name: custom_scoring_engine
+            role: 评分体系与产品强绑定，建议自研
+            type: custom
+            replaceable: false
+        observability:
+          - name: langfuse
+            role: LLM / step / eval tracing
+            type: observability
+            replaceable: true
+          - name: phoenix
+            role: AI observability / experiment analysis
+            type: observability
+            replaceable: true
+      evaluation:
+        metrics:
+          - name: score_stability
+            definition: 同文档多次评分波动是否可控
+          - name: metric_explainability
+            definition: 低分是否可定位到字段/条目/来源
+          - name: low_score_localization_accuracy
+            definition: 低分原因定位准确度
+        thresholds:
+          score_stability:
+            target: 0.90
+            minimum: 0.80
+          metric_explainability:
+            target: 0.90
+            minimum: 0.80
+          low_score_localization_accuracy:
+            target: 0.85
+            minimum: 0.75
+      observability:
+        traces:
+          - calculate_scorecard
+        metrics:
+          - scoring_duration_ms
+          - failing_metric_count
+          - failing_field_count
+        logs:
+          - below_threshold_metrics
+          - top_risk_fields
+        artifacts:
+          - scorecard.v0.json
+
+    - step_id: step_5_agent_plan_generation
+      name: 生成 Agent Plan
+      purpose: >
+        基于低分项、缺口和文档理解结果，生成一份可审批、可执行、可追踪的优化计划。
+      inputs:
+        - document_ir
+        - document_understanding
+        - structured_draft_v0
+        - extraction_scorecard_v0
+        - schema_profile
+        - expert_guidance_profile
+      outputs:
+        - agent_plan_v0
+      actions:
+        - 对低分指标生成 targeted actions
+        - 生成 step 级计划
+        - 为每步附 evidence blocks、rationale、expected output
+        - 预测分数改善方向
+      open_source_candidates:
+        primary:
+          - name: langgraph
+            role: stateful workflow / durable execution / HITL
+            type: orchestration
+            replaceable: true
+          - name: hermes_style_runtime
+            role: reasoning / memory / skill-style planning
+            type: runtime_pattern
+            replaceable: true
+        alternatives:
+          - name: rule_based_planner
+            role: 基线 planner
+            type: baseline
+            replaceable: true
+      evaluation:
+        metrics:
+          - name: plan_coverage
+            definition: 计划是否覆盖低分指标和关键缺口
+          - name: plan_precision
+            definition: 计划步骤是否对准真实问题
+          - name: plan_actionability
+            definition: 计划是否可执行
+          - name: expected_score_gain_quality
+            definition: 预期提升是否合理
+          - name: plan_acceptance_rate
+            definition: 专家批准率
+        thresholds:
+          plan_coverage:
+            target: 0.90
+            minimum: 0.80
+          plan_precision:
+            target: 0.85
+            minimum: 0.75
+          plan_actionability:
+            target: 0.90
+            minimum: 0.80
+      observability:
+        traces:
+          - generate_agent_plan
+        metrics:
+          - plan_generation_duration_ms
+          - plan_step_count
+          - target_metric_distribution
+        logs:
+          - planner_name
+          - planner_version
+          - uncovered_low_score_metrics
+        artifacts:
+          - agent_plan.v0.json
+
+    - step_id: step_6_expert_approval
+      name: 专家确认
+      purpose: >
+        在执行前让专家确认整份计划或逐步确认，以降低错误补强风险。
+      inputs:
+        - agent_plan_v0
+      outputs:
+        - approved_agent_plan
+        - approval_log
+      actions:
+        - 支持 approve all
+        - 支持 step-by-step approval
+        - 支持 edit-then-approve
+        - 支持 reject with reason
+      open_source_candidates:
+        primary:
+          - name: langgraph_hitl_pattern
+            role: 将审批节点作为明确的人机协同状态
+            type: orchestration_pattern
+            replaceable: true
+        self_built:
+          - approval_ui
+          - step_editor
+      evaluation:
+        metrics:
+          - name: plan_approval_rate
+            definition: 整体计划批准率
+          - name: step_approval_rate
+            definition: 计划步骤批准率
+          - name: edit_before_approval_rate
+            definition: 需要编辑后批准的比例
+          - name: rejection_reason_distribution
+            definition: 驳回原因分布
+        thresholds:
+          plan_approval_rate:
+            target: 0.80
+            minimum: 0.60
+          step_approval_rate:
+            target: 0.90
+            minimum: 0.75
+      observability:
+        traces:
+          - approve_plan
+          - approve_plan_step
+        metrics:
+          - approval_duration_ms
+          - rejected_step_count
+          - edited_step_count
+        logs:
+          - approver_id
+          - rejected_reasons
+        artifacts:
+          - approval_log.json
+          - approved_agent_plan.json
+
+    - step_id: step_7_stepwise_improvement_run
+      name: 分步执行补强
+      purpose: >
+        按已批准计划逐步执行优化，生成候选修改、补全字段、重绑来源，并记录 step 级结果。
+      inputs:
+        - approved_agent_plan
+        - document_ir
+        - document_understanding
+        - structured_draft_v0
+      outputs:
+        - document_v_next
+        - structured_draft_candidate_v1
+        - step_outputs
+      actions:
+        - 执行 targeted reread
+        - 执行 rewrite / add / clarify / complete_list
+        - 重新绑定 source refs
+        - 对 inferred_candidate 发起确认
+        - 更新草稿文档与结构化草稿
+      open_source_candidates:
+        primary:
+          - name: langgraph
+            role: step graph / checkpoint / pause-resume / HITL
+            type: orchestration
+            replaceable: true
+          - name: hermes_style_runtime
+            role: step reasoning / skills / memory
+            type: runtime_pattern
+            replaceable: true
+        alternatives:
+          - name: single_shot_rewrite
+            role: 差基线
+            type: baseline
+            replaceable: true
+      evaluation:
+        metrics:
+          - name: step_completion_rate
+            definition: 计划步骤完成率
+          - name: step_failure_rate
+            definition: 计划步骤失败率
+          - name: step_rework_rate
+            definition: 返工率
+          - name: source_backed_change_rate
+            definition: 改动是否有来源支撑
+          - name: inference_overreach_rate
+            definition: 过度推断率
+        thresholds:
+          step_completion_rate:
+            target: 0.90
+            minimum: 0.75
+          step_failure_rate:
+            target_max: 0.10
+            hard_max: 0.20
+          source_backed_change_rate:
+            target: 0.90
+            minimum: 0.80
+          inference_overreach_rate:
+            target_max: 0.10
+            hard_max: 0.20
+      observability:
+        traces:
+          - execute_plan_step
+          - targeted_reread
+          - rewrite_section
+          - add_missing_field
+          - rebind_source
+        metrics:
+          - step_duration_ms
+          - token_usage
+          - cost_estimate
+          - changed_field_count
+          - changed_item_count
+        logs:
+          - step_status_transition
+          - human_intervention_count
+          - step_error_reason
+        artifacts:
+          - step_input.json
+          - step_output.json
+          - step_diff.json
+          - document_v_next.json
+          - structured_draft_candidate_v1.json
+
+    - step_id: step_8_reextract_rescore
+      name: 重抽取 + 重评分
+      purpose: >
+        对优化后的文档重新抽取与评分，验证文档是否在定义的质量体系下真的变好。
+      inputs:
+        - document_v_next
+        - schema_profile
+        - evaluation_profile
+      outputs:
+        - structured_draft_v1
+        - extraction_scorecard_v1
+        - score_delta
+      actions:
+        - 复用相同抽取器重跑结构化抽取
+        - 复用评分器重跑评分
+        - 比较前后 score delta
+      open_source_candidates:
+        extraction_layer:
+          - name: same_as_step_3
+            role: 与初始抽取保持同一套或对照版本
+            type: extraction
+            replaceable: true
+        scoring_layer:
+          - name: custom_scoring_engine
+            role: 自研评分器
+            type: custom
+            replaceable: false
+      evaluation:
+        metrics:
+          - name: score_delta_by_metric
+            definition: 各指标前后变化
+          - name: improved_fields_count
+            definition: 质量提升字段数
+          - name: regressed_fields_count
+            definition: 回退字段数
+          - name: net_quality_gain
+            definition: 综合质量净增益
+        thresholds:
+          net_quality_gain:
+            target: positive
+            minimum: non_negative
+          regressed_fields_count:
+            target_max: 0
+            hard_max: 2
+      observability:
+        traces:
+          - reextract_structured_draft
+          - recalculate_scorecard
+          - compare_score_delta
+        metrics:
+          - reextract_duration_ms
+          - rescoring_duration_ms
+          - improved_metric_count
+          - regressed_metric_count
+        logs:
+          - unchanged_low_score_metrics
+          - unexpected_regressions
+        artifacts:
+          - structured_draft.v1.json
+          - scorecard.v1.json
+          - score_delta.json
+
+    - step_id: step_9_expert_review_feedback
+      name: 专家评分与策略回流
+      purpose: >
+        用专家评分验证最终文档质量，并将专家反馈沉淀为后续抽取策略与计划策略优化输入。
+      inputs:
+        - document_v_next
+        - extraction_scorecard_v1
+        - score_delta
+      outputs:
+        - expert_review
+        - strategy_feedback
+      actions:
+        - 专家给整体评分
+        - 专家给维度评分
+        - 专家填写评语
+        - 将反馈写入策略回流池
+      open_source_candidates:
+        observability:
+          - name: langfuse
+            role: 将 expert feedback 关联到 runs/prompts/evals
+            type: observability
+            replaceable: true
+          - name: phoenix
+            role: 运行对比与反馈分析
+            type: observability
+            replaceable: true
+        self_built:
+          - expert_review_form
+          - strategy_feedback_writer
+      evaluation:
+        metrics:
+          - name: expert_overall_score
+            definition: 专家总评分
+          - name: expert_acceptance_rate
+            definition: 专家是否接受最终版本
+          - name: expert_override_rate
+            definition: 专家需要大幅覆盖修改的比例
+          - name: metric_expert_correlation
+            definition: 机器评分与专家评分相关性
+        thresholds:
+          expert_overall_score:
+            target: 4.0
+            minimum: 3.5
+          expert_acceptance_rate:
+            target: 0.80
+            minimum: 0.60
+      observability:
+        traces:
+          - submit_expert_review
+          - write_strategy_feedback
+        metrics:
+          - review_duration_ms
+          - expert_score
+          - accepted_final_version
+        logs:
+          - review_comments
+          - disagreement_with_machine_score
+        artifacts:
+          - expert_review.json
+          - strategy_feedback.json
+
+  global_ab_test_matrix:
+    parse_layer:
+      candidates:
+        - docling
+        - marker
+        - mineru
+      compare_by:
+        - parse_success_rate
+        - table_preservation_rate
+        - source_span_completeness
+        - downstream_field_coverage
+
+    understanding_layer:
+      candidates:
+        - section_first_summaries
+        - raptor_like_hierarchy
+        - contextual_retrieval_enhanced
+      compare_by:
+        - summary_faithfulness
+        - theme_goal_accuracy
+        - downstream_field_accuracy
+
+    extraction_layer:
+      candidates:
+        - prompt_only_extraction
+        - schema_guided_extraction
+        - hyper_extract_style_template_extraction
+        - marker_schema_extraction
+      compare_by:
+        - field_coverage
+        - item_f1
+        - inference_handling_accuracy
+        - human_revision_rate
+
+    planning_layer:
+      candidates:
+        - rule_based_plan
+        - llm_only_plan
+        - hybrid_scorecard_guided_plan
+      compare_by:
+        - plan_precision
+        - plan_coverage
+        - plan_acceptance_rate
+        - net_quality_gain
+
+    execution_layer:
+      candidates:
+        - single_shot_rewrite
+        - stepwise_targeted_rewrite
+        - stepwise_targeted_rewrite_with_expert_checkpoints
+      compare_by:
+        - source_backed_change_rate
+        - inference_overreach_rate
+        - expert_acceptance_rate
+        - score_delta_by_metric
+
+  rollout_recommendation:
+    phase_1:
+      focus:
+        - step_0
+        - step_1
+        - step_3
+        - step_4
+        - step_5
+        - step_6
+      goal: 先把“抽取 → 评分 → 计划 → 审批”闭环做稳
+
+    phase_2:
+      focus:
+        - step_7
+        - step_8
+      goal: 让 Agent 按步骤补强并能证明质量提升
+
+    phase_3:
+      focus:
+        - step_2
+        - step_9
+        - global_ab_test_matrix
+      goal: 提升长文档理解与系统自进化能力

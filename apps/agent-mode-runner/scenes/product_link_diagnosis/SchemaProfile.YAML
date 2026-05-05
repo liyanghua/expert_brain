@@ -1,0 +1,169 @@
+profile_id: schema.product_link_diagnosis.v1
+profile_name: 商品链接诊断场景 SchemaProfile
+scene: 商品链接诊断
+domain: ecommerce_growth
+version: v1
+status: draft
+
+description: >
+  用于商品链接诊断类业务文档的结构化抽取定义。
+  目标是从原始文档中抽取出可用于 Ground Truth 沉淀的核心业务要素，
+  为后续评分、优化 Plan 和 Agent Strategy 编译提供基础。
+
+object_type: BusinessDocStructuredDraft
+
+required_fields:
+  - business_scenario
+  - scenario_goal
+  - process_flow_or_business_model
+  - execution_steps
+  - faq_types
+  - judgment_basis
+  - judgment_criteria
+  - resolution_methods
+  - trigger_conditions
+  - validation_methods
+
+optional_fields:
+  - required_inputs
+  - deliverables
+  - key_node_rationales
+  - page_screenshots
+  - termination_conditions
+  - tool_templates
+  - exceptions_and_non_applicable_scope
+
+inferred_candidate_fields:
+  - key_node_rationales
+  - termination_conditions
+  - exceptions_and_non_applicable_scope
+  - deliverables
+
+field_status_enum:
+  - missing
+  - partial
+  - drafted
+  - confirmed
+  - inferred_candidate
+
+field_definitions:
+  business_scenario:
+    type: single_text
+    required: true
+    description: 该文档所属的业务场景
+    extraction_hint: >
+      优先从标题、开头摘要、任务定义中识别。
+
+  scenario_goal:
+    type: single_text
+    required: true
+    description: 本次诊断或优化任务要达成的业务结果
+    extraction_hint: >
+      优先从“目标”“目的”“要解决什么问题”“要达成什么结果”等表述中抽取。
+
+  process_flow_or_business_model:
+    type: single_text_or_outline
+    required: true
+    description: 支撑优化动作的流程图、诊断模型或业务框架
+    extraction_hint: >
+      优先识别“维度拆解”“诊断模型”“流程图”“业务模型”“框架”。
+
+  execution_steps:
+    type: list_step
+    required: true
+    description: 按照业务模型拆解出的具体执行步骤
+    extraction_hint: >
+      优先识别顺序型描述、编号步骤、操作动作、执行路径。
+
+  faq_types:
+    type: list_issue
+    required: true
+    description: 常见问题类型及其表现形式
+    extraction_hint: >
+      优先识别“常见问题”“问题分类”“异常表现”“机会类型”。
+
+  judgment_basis:
+    type: list_metric
+    required: true
+    description: 用于诊断问题和验证效果的核心指标或信号
+    extraction_hint: >
+      优先识别指标名、变量名、监控项、数据依据。
+
+  judgment_criteria:
+    type: list_rule
+    required: true
+    description: 指标的阈值、等级、频次、时间窗口和好坏标准
+    extraction_hint: >
+      优先识别“>= <= > <”“差/合格/优秀”“连续N天”“行业均值基准”等表达。
+
+  resolution_methods:
+    type: list_action
+    required: true
+    description: 针对问题类型的具体解决方法与执行动作
+    extraction_hint: >
+      优先识别“优化动作”“建议动作”“问题解决方法”“怎么改”。
+
+  trigger_conditions:
+    type: list_condition
+    required: true
+    description: 优化流程或诊断流程启动的前提条件
+    extraction_hint: >
+      优先识别“触发条件”“在什么情况下开始”“达到何种数据阈值才进入诊断”。
+
+  termination_conditions:
+    type: list_condition
+    required: false
+    description: 流程何时结束、停止、转入维持或退出
+    extraction_hint: >
+      若原文未显式给出，可归纳 candidate，但不得直接 confirmed。
+
+  validation_methods:
+    type: list_validation
+    required: true
+    description: 用什么数据或方式证明优化动作有效
+    extraction_hint: >
+      优先识别“验证方式”“如何证明有效”“复盘指标”。
+
+  tool_templates:
+    type: list_template
+    required: false
+    description: 可复用的工具、诊断表、执行模板、方案模板
+    extraction_hint: >
+      注意区分工具与模板。工具是系统/平台，模板是可复用表单。
+
+  exceptions_and_non_applicable_scope:
+    type: list_exception
+    required: false
+    description: 方法不适用的场景、边界条件和例外情况
+    extraction_hint: >
+      优先识别“例外情况”“不适用”“样本不足”“平台规则变化”等表达。
+
+field_dependencies:
+  - from: judgment_basis
+    to: judgment_criteria
+    relation: criteria_should_reference_basis
+  - from: faq_types
+    to: resolution_methods
+    relation: issue_should_have_resolution
+  - from: trigger_conditions
+    to: termination_conditions
+    relation: process_boundary_pair
+  - from: scenario_goal
+    to: validation_methods
+    relation: validation_should_support_goal
+  - from: process_flow_or_business_model
+    to: execution_steps
+    relation: steps_should_follow_model
+
+normalization_rules:
+  - 将“商品链接优化”与“商品链接诊断”归一为同一场景语义族
+  - 将“判断指标”“判断依据”“核心变量”统一归入 judgment_basis
+  - 将“判断标准”“阈值”“等级划分”“好坏标准”统一归入 judgment_criteria
+  - 将“执行动作”“建议动作”“优化动作”“解决方法”统一归入 resolution_methods
+  - 将“验证方式”“复盘指标”“效果验证”统一归入 validation_methods
+
+output_requirements:
+  - 每个字段必须有 confidence
+  - 每个字段必须有 field_status
+  - 已抽字段尽量绑定 source_refs
+  - inferred_candidate 字段必须显式标记，不能伪装为 confirmed

@@ -1,0 +1,33 @@
+{
+  "name": "opennotebook-expert-brain",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "../node_modules/.bin/concurrently -n server,web -c blue,green \"npm run dev:server\" \"npm run dev:web\"",
+    "dev:web": "../apps/api/node_modules/.bin/vite",
+    "dev:server": "../node_modules/.bin/tsx watch --tsconfig tsconfig.server.json server/index.ts",
+    "build": "npm run build:web && npm run build:server",
+    "build:web": "../apps/api/node_modules/.bin/vite build",
+    "build:server": "../node_modules/.bin/tsc -p tsconfig.server.json",
+    "preview": "../apps/api/node_modules/.bin/vite preview",
+    "test": "../apps/api/node_modules/.bin/vitest run",
+    "test:server": "../apps/api/node_modules/.bin/vitest run server/*.test.ts server/hermes/*.test.ts --environment node",
+    "typecheck": "../node_modules/.bin/tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.14",
+    "hono": "^4.12.15",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.7.0",
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.2",
+    "vitest": "^2.1.9"
+  }
+}

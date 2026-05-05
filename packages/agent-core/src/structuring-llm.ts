@@ -4,10 +4,12 @@ import {
   GlobalQualityTriageSchema,
   MAX_PRIMARY_TASKS,
   PRIMARY_TASK_FIELD_PROFILES,
+  QualityIssueIndexSchema,
   STRUCTURED_FIELD_KEYS,
   emptyGroundTruthDraft,
   type GlobalQualityTriage,
   type GroundTruthDraft,
+  type QualityIssueIndex,
   type PrimaryTaskFieldKey,
   type StructuredFieldKey,
 } from "@ebs/ground-truth-schema";
@@ -21,11 +23,13 @@ import {
   buildStructuringSystemPrompt,
   buildStructuringPromptInput,
 } from "./structuring-prompt.js";
+import { buildGuidedQuestionSeed } from "./question-guidance.js";
 
 export type StructuringMode = "llm" | "rules" | "rules_fallback";
 export type GlobalQualityTriageMode = "llm" | "rules" | "rules_fallback";
 export type StructuringFailureReason =
   | "disabled"
+  | "empty_response"
   | "http_error"
   | "timeout"
   | "json_parse_error"
@@ -355,6 +359,23 @@ function taskSortKey(task: GlobalQualityTriage["recommended_tasks"][number]) {
   ] as const;
 }
 
+function guidedTriageQuestion(input: {
+  fieldKey?: string;
+  question?: string;
+  reason?: string;
+}) {
+  const question = input.question?.trim();
+  if (!input.fieldKey || !question) return question ?? "";
+  if (/老师|您通常|能不能请您|请您|实际操作|核心指标/.test(question)) {
+    return question;
+  }
+  return buildGuidedQuestionSeed({
+    fieldKey: input.fieldKey,
+    seed: question,
+    gapReason: input.reason,
+  });
+}
+
 function betterPrimaryTask(
   current: GlobalQualityTriage["recommended_tasks"][number] | undefined,
   next: GlobalQualityTriage["recommended_tasks"][number],
@@ -390,6 +411,11 @@ function prioritizeGlobalQualityTasks(
       target_field,
       betterPrimaryTask(taskByField.get(target_field), {
         ...task,
+        question: guidedTriageQuestion({
+          fieldKey: target_field,
+          question: task.question,
+          reason: task.reason,
+        }),
         target_field,
         source_block_ids,
       }),
@@ -403,7 +429,11 @@ function prioritizeGlobalQualityTasks(
     taskByField.set(profile.field_key, {
       title: profile.missing_title,
       reason: profile.missing_reason,
-      question: profile.missing_question,
+      question: guidedTriageQuestion({
+        fieldKey: profile.field_key,
+        question: profile.missing_question,
+        reason: profile.missing_reason,
+      }),
       target_field: profile.field_key,
       source_block_ids: [],
       priority: "high",
@@ -434,6 +464,10 @@ function prioritizeGlobalQualityTasks(
     if (!suggestedByField.has(target_field)) {
       suggestedByField.set(target_field, {
         ...question,
+        question: guidedTriageQuestion({
+          fieldKey: target_field,
+          question: question.question,
+        }),
         target_field,
         source_block_ids,
       });
@@ -467,6 +501,68 @@ function prioritizeGlobalQualityTasks(
     major_gaps,
     recommended_tasks,
     suggested_questions,
+  });
+}
+
+export function deriveQualityIssueIndexFromTriage(input: {
+  docId: string;
+  versionId: string;
+  triage: GlobalQualityTriage;
+  ir: DocumentIR;
+  now?: string;
+}): QualityIssueIndex {
+  const validBlockIds = new Set(input.ir.blocks.map((block) => block.block_id));
+  const filterBlockIds = (ids: (string | undefined)[]) =>
+    [
+      ...new Set(
+        ids.filter(
+          (id): id is string => typeof id === "string" && validBlockIds.has(id),
+        ),
+      ),
+    ];
+  const globalSupportBlockIds = filterBlockIds(
+    input.triage.source_refs.map((ref) => ref.block_id),
+  );
+  const issues = input.triage.recommended_tasks.map((task, index) => {
+    const primaryBlockIds = filterBlockIds(task.source_block_ids ?? []);
+    const relatedGapBlockIds = filterBlockIds(
+      input.triage.major_gaps
+        .filter((gap) => !task.target_field || gap.field_key === task.target_field)
+        .flatMap((gap) => gap.source_refs.map((ref) => ref.block_id)),
+    );
+    const supportingBlockIds = filterBlockIds([
+      ...globalSupportBlockIds,
+      ...relatedGapBlockIds,
+    ]).filter((blockId) => !primaryBlockIds.includes(blockId));
+    const hasPrimaryGrounding = primaryBlockIds.length > 0;
+
+    return {
+      issue_id: task.task_id ?? `quality-issue-${index + 1}`,
+      severity: task.priority,
+      issue_type: task.target_field
+        ? `missing_or_weak_${task.target_field}`
+        : "quality_gap",
+      summary: task.title,
+      why_it_matters: task.reason,
+      primary_block_ids: primaryBlockIds,
+      supporting_block_ids: supportingBlockIds,
+      target_field: task.target_field ?? null,
+      recommended_question: task.question,
+      suggested_action: task.title,
+      global_context_summary: input.triage.summary,
+      grounding_reason: hasPrimaryGrounding
+        ? "质量诊断任务已定位到这些原文 block。"
+        : "该问题来自全文诊断，尚未定位到可直接修改的 block。",
+      confidence: hasPrimaryGrounding ? 0.74 : 0.46,
+    };
+  });
+
+  return QualityIssueIndexSchema.parse({
+    doc_id: input.docId,
+    version_id: input.versionId,
+    generated_at: input.now ?? new Date().toISOString(),
+    global_context_summary: input.triage.summary,
+    issues,
   });
 }
 
@@ -581,11 +677,17 @@ function classifyLlmError(err: unknown): {
   message: string;
 } {
   const message = err instanceof Error ? err.message : String(err);
+  if (/empty message content|empty_response|空响应/i.test(message)) {
+    return { reason: "empty_response", message };
+  }
   if (/Timeout|aborted|AbortError/i.test(message)) {
     return { reason: "timeout", message };
   }
   if (/LLM HTTP/i.test(message)) {
     return { reason: "http_error", message };
+  }
+  if (err instanceof Error && err.name === "ZodError") {
+    return { reason: "schema_validation_error", message };
   }
   return { reason: "unknown_error", message };
 }
@@ -594,6 +696,9 @@ function isDashScopeRetryable(reason: StructuringFailureReason, message: string)
   return (
     reason === "timeout" ||
     reason === "http_error" ||
+    reason === "empty_response" ||
+    reason === "json_parse_error" ||
+    reason === "schema_validation_error" ||
     /fetch failed|ECONNRESET|socket hang up|network/i.test(message)
   );
 }
@@ -685,7 +790,11 @@ function heuristicGlobalQualityTriage(ir: DocumentIR): GlobalQualityTriage {
     recommended_tasks.push({
       title: input.title,
       reason: input.message,
-      question: input.question,
+      question: guidedTriageQuestion({
+        fieldKey: input.field_key,
+        question: input.question,
+        reason: input.message,
+      }),
       target_field: input.field_key,
       source_block_ids: sourceBlockIds,
       priority: input.priority ?? "medium",
@@ -725,6 +834,18 @@ function heuristicGlobalQualityTriage(ir: DocumentIR): GlobalQualityTriage {
     })),
     source_refs,
   });
+}
+
+function parseGlobalQualityTriageRaw(raw: string, ir: DocumentIR): GlobalQualityTriage {
+  return prioritizeGlobalQualityTasks(
+    groundedGlobalQualityTriage(
+      GlobalQualityTriageSchema.parse(
+        normalizeGlobalQualityTriagePayload(extractJsonObject(raw)),
+      ),
+      ir,
+    ),
+    ir,
+  );
 }
 
 export async function runGlobalQualityTriageWithLlmOrFallback(
@@ -787,15 +908,7 @@ export async function runGlobalQualityTriageWithLlmOrFallback(
       label,
       promptDiagnostics: promptDiagnostics("global_triage", input.context),
     });
-    const parsed = prioritizeGlobalQualityTasks(
-      groundedGlobalQualityTriage(
-        GlobalQualityTriageSchema.parse(
-          normalizeGlobalQualityTriagePayload(extractJsonObject(raw)),
-        ),
-        ir,
-      ),
-      ir,
-    );
+    const parsed = parseGlobalQualityTriageRaw(raw, ir);
     diagnostics.attempts.push({
       ...attemptBase,
       status: "ok",
@@ -825,6 +938,88 @@ export async function runGlobalQualityTriageWithLlmOrFallback(
       message,
       elapsed_ms: Date.now() - startedAt,
     });
+
+    if (hasDashScopeFallbackConfig() && isDashScopeRetryable(reason, message)) {
+      const fallbackLabel = `${label}.fallback_dashscope`;
+      const fallbackConfig = resolveLlmRequestConfig({
+        label: fallbackLabel,
+        timeoutMs: config.timeoutMs,
+        provider: "dashscope",
+      });
+      const fallbackAttemptBase = {
+        stage: "global_triage" as const,
+        label: fallbackLabel,
+        provider: fallbackConfig.provider,
+        model: fallbackConfig.model,
+        timeout_ms: fallbackConfig.timeoutMs,
+        request_params: {
+          route: fallbackConfig.route,
+          timeout_ms: fallbackConfig.timeoutMs,
+          max_tokens: fallbackConfig.maxTokens,
+          response_json: fallbackConfig.responseJson,
+          temperature: Number(process.env.EBS_LLM_TEMPERATURE ?? 0.2),
+          fallback_from: label,
+          fallback_reason: reason,
+        },
+        system_prompt_chars: system.length,
+        user_prompt_chars: input.prompt.length,
+        system_prompt: system,
+        user_prompt: input.prompt,
+      };
+      const fallbackStartedAt = Date.now();
+      console.info("[EBS LLM fallback]", {
+        from: label,
+        to: fallbackLabel,
+        provider: "dashscope",
+        reason,
+        message,
+      });
+      try {
+        const fallbackRaw = await chatCompletionText({
+          system,
+          user: input.prompt,
+          timeoutMs: fallbackConfig.timeoutMs,
+          label: fallbackLabel,
+          provider: "dashscope",
+          promptDiagnostics: promptDiagnostics("global_triage", input.context),
+        });
+        const parsed = parseGlobalQualityTriageRaw(fallbackRaw, ir);
+        diagnostics.attempts.push({
+          ...fallbackAttemptBase,
+          status: "ok",
+          elapsed_ms: Date.now() - fallbackStartedAt,
+        });
+        return {
+          triage: parsed,
+          triage_mode: "llm",
+          diagnostics,
+        };
+      } catch (fallbackErr) {
+        const fallbackFailure =
+          fallbackErr instanceof SyntaxError
+            ? {
+                reason: "json_parse_error" as const,
+                message: fallbackErr.message,
+              }
+            : classifyLlmError(fallbackErr);
+        console.info("[EBS Global Quality Triage fallback failed]", {
+          stage: "global_triage",
+          provider: "dashscope",
+          reason: fallbackFailure.reason,
+          message: fallbackFailure.message,
+        });
+        diagnostics.llm_failure_reason = fallbackFailure.reason;
+        diagnostics.llm_failure_message = fallbackFailure.message;
+        diagnostics.attempts.push({
+          ...fallbackAttemptBase,
+          status: "failed",
+          reason: fallbackFailure.reason,
+          message: fallbackFailure.message,
+          elapsed_ms: Date.now() - fallbackStartedAt,
+        });
+      }
+    }
+
     diagnostics.attempts.push({ stage: "rules", status: "ok" });
     return {
       triage: heuristicGlobalQualityTriage(ir),

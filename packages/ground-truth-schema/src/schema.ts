@@ -155,6 +155,36 @@ export const GlobalQualityTriageSchema = z.object({
 
 export type GlobalQualityTriage = z.infer<typeof GlobalQualityTriageSchema>;
 
+export const QualityIssueSeveritySchema = z.enum(["low", "medium", "high"]);
+
+export const QualityIssueSchema = z.object({
+  issue_id: z.string().min(1),
+  severity: QualityIssueSeveritySchema.default("medium"),
+  issue_type: z.string().min(1).default("quality_gap"),
+  summary: z.string().min(1),
+  why_it_matters: z.string().optional(),
+  primary_block_ids: z.array(z.string()).default([]),
+  supporting_block_ids: z.array(z.string()).default([]),
+  target_field: z.string().nullable().optional(),
+  recommended_question: z.string().optional(),
+  suggested_action: z.string().optional(),
+  global_context_summary: z.string().optional(),
+  grounding_reason: z.string().optional(),
+  confidence: z.number().min(0).max(1).default(0.6),
+});
+
+export type QualityIssue = z.infer<typeof QualityIssueSchema>;
+
+export const QualityIssueIndexSchema = z.object({
+  doc_id: z.string().min(1),
+  version_id: z.string().min(1),
+  generated_at: z.string().datetime(),
+  global_context_summary: z.string().optional(),
+  issues: z.array(QualityIssueSchema).default([]),
+});
+
+export type QualityIssueIndex = z.infer<typeof QualityIssueIndexSchema>;
+
 export const DocumentMetaDraftSchema = z.object({
   document_id: z.string(),
   title: z.string().optional(),
@@ -486,6 +516,29 @@ export const ExpertNoteSchema = z.object({
 });
 
 export type ExpertNote = z.infer<typeof ExpertNoteSchema>;
+
+export const SourceAnnotationSchema = z.object({
+  annotation_id: z.string().min(1),
+  doc_id: z.string().min(1),
+  version_id: z.string().min(1),
+  block_id: z.string().min(1),
+  field_key: z.string().min(1),
+  content: z.unknown(),
+  annotation_type: z
+    .enum(["expert_writeback", "quality_issue"])
+    .default("expert_writeback"),
+  issue_id: z.string().optional(),
+  severity: QualityIssueSeveritySchema.optional(),
+  issue_type: z.string().optional(),
+  block_role: z.enum(["primary", "supporting"]).optional(),
+  recommended_question: z.string().optional(),
+  thread_id: z.string().nullable().optional(),
+  candidate_id: z.string().nullable().optional(),
+  created_at: z.string().datetime(),
+  updated_at: z.string().datetime(),
+});
+
+export type SourceAnnotation = z.infer<typeof SourceAnnotationSchema>;
 
 export const LlmCallDiagnosticsSchema = z.object({
   label: z.string(),

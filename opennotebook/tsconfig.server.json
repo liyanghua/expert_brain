@@ -1,0 +1,41 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM"],
+    "rootDir": ".",
+    "outDir": "dist-server",
+    "noEmit": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": true,
+    "types": ["node"],
+    "baseUrl": "..",
+    "paths": {
+      "@ebs/agent-core": ["packages/agent-core"],
+      "@ebs/agent-core/*": ["packages/agent-core/dist/*"],
+      "@ebs/document-ir": ["packages/document-ir"],
+      "@ebs/document-ir/*": ["packages/document-ir/dist/*"],
+      "@ebs/extraction-scorecard": ["packages/extraction-scorecard"],
+      "@ebs/extraction-scorecard/*": ["packages/extraction-scorecard/dist/*"],
+      "@ebs/diff-engine": ["packages/diff-engine"],
+      "@ebs/diff-engine/*": ["packages/diff-engine/dist/*"],
+      "@ebs/ground-truth-schema": ["packages/ground-truth-schema"],
+      "@ebs/ground-truth-schema/*": ["packages/ground-truth-schema/dist/*"],
+      "@ebs/job-runner": ["packages/job-runner"],
+      "@ebs/job-runner/*": ["packages/job-runner/dist/*"],
+      "@ebs/parsing": ["packages/parsing"],
+      "@ebs/parsing/*": ["packages/parsing/dist/*"],
+      "@ebs/storage": ["packages/storage"],
+      "@ebs/storage/*": ["packages/storage/dist/*"],
+      "hono": ["apps/api/node_modules/hono/dist/types/index.d.ts"],
+      "hono/*": ["apps/api/node_modules/hono/dist/types/*"],
+      "@hono/node-server": ["apps/api/node_modules/@hono/node-server/dist/index.d.ts"],
+      "@hono/node-server/*": ["apps/api/node_modules/@hono/node-server/dist/*"]
+    }
+  },
+  "include": ["server/**/*.ts", "server/**/*.tsx"],
+  "exclude": ["server/**/*.test.ts"]
+}

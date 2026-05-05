@@ -48,7 +48,7 @@ function defaultProvider(): LlmProvider {
 }
 
 function routeForLabel(label?: string): LlmRoute {
-  if (label === "structuring.global_triage") return "triage";
+  if (label?.startsWith("structuring.global_triage")) return "triage";
   if (label?.startsWith("qa.refine_question")) return "refine";
   if (label?.startsWith("qa.answer")) return "qa";
   return "default";
@@ -145,7 +145,10 @@ export function resolveLlmRequestConfig(opts: {
     provider,
     base,
     apiKey,
-    model: opts.model ?? routeEnv(route, "MODEL") ?? defaultModel,
+    model:
+      opts.model ??
+      (provider === "dashscope" ? undefined : routeEnv(route, "MODEL")) ??
+      defaultModel,
     timeoutMs:
       opts.timeoutMs ??
       positiveNumber(routeEnv(route, "TIMEOUT_MS"), defaultTimeoutMs),

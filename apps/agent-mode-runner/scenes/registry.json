@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "default_scene_id": "product_link_diagnosis",
+  "scenes": [
+    {
+      "scene_id": "product_link_diagnosis",
+      "scene_name": "商品链接诊断",
+      "domain": "ecommerce_growth",
+      "directory": "product_link_diagnosis",
+      "default_input": "source.md",
+      "schema_profile": "SchemaProfile.YAML",
+      "expert_guidance_profile": "ExpertGuidanceProfile.YAML",
+      "evaluation_profile": "EvaluationProfile.YAML"
+    }
+  ]
+}

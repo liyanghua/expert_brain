@@ -1,0 +1,29 @@
+{
+  "name": "@ebs/agent-mode-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -w exec tsc -p apps/agent-mode-runner/tsconfig.json",
+    "typecheck": "pnpm -w exec tsc -p apps/agent-mode-runner/tsconfig.json --noEmit",
+    "test": "pnpm -w exec node --import tsx --test apps/agent-mode-runner/tests/*.test.ts",
+    "smoke": "pnpm -w exec tsx apps/agent-mode-runner/src/cli.ts smoke",
+    "step": "pnpm -w exec tsx apps/agent-mode-runner/src/cli.ts step",
+    "resume": "pnpm -w exec tsx apps/agent-mode-runner/src/cli.ts resume",
+    "report": "pnpm -w exec tsx apps/agent-mode-runner/src/cli.ts report",
+    "review": "pnpm -w exec tsx apps/agent-mode-runner/src/review-server.ts"
+  },
+  "dependencies": {
+    "@ebs/agent-core": "workspace:*",
+    "@ebs/document-ir": "workspace:*",
+    "@ebs/extraction-scorecard": "workspace:*",
+    "@ebs/ground-truth-schema": "workspace:*",
+    "@ebs/parsing": "workspace:*",
+    "marked": "^18.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

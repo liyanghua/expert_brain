@@ -22,6 +22,7 @@ import {
   resolveLlmRequestConfig,
   type LlmProvider,
 } from "./llm-client.js";
+import { buildGuidedQuestionSeed, guidanceForField } from "./question-guidance.js";
 
 function blockRefs(blocks: DocumentBlock[]): SourceRef[] {
   return blocks.map((b) => ({
@@ -276,6 +277,70 @@ function compactEvidenceBlocks(blocks: DocumentBlock[], opts?: {
   }));
 }
 
+const STRUCTURED_FIELD_KEY_SET = new Set<string>(STRUCTURED_FIELD_KEYS);
+const STRUCTURED_FIELD_KEY_LIST = STRUCTURED_FIELD_KEYS.join(", ");
+
+function isStructuredFieldKeyValue(
+  value: string | null | undefined,
+): value is StructuredFieldKey {
+  return Boolean(value && STRUCTURED_FIELD_KEY_SET.has(value));
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function extractJsonValue(raw: string): unknown {
+  const t = raw.trim();
+  const fence = /^```(?:json)?\s*([\s\S]*?)```/im.exec(t);
+  const body = fence ? fence[1]!.trim() : t;
+  if (body.startsWith("{")) return JSON.parse(body) as unknown;
+  const start = body.indexOf("{");
+  const end = body.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    return JSON.parse(body.slice(start, end + 1)) as unknown;
+  }
+  return JSON.parse(body) as unknown;
+}
+
+function normalizeQaResponsePayload(
+  value: unknown,
+  requestedTargetField?: string | null,
+): unknown {
+  const input = asRecord(value);
+  const requestedField = isStructuredFieldKeyValue(requestedTargetField)
+    ? requestedTargetField
+    : null;
+  const modelTargetField =
+    typeof input.target_field === "string" ? input.target_field : null;
+  const targetField = isStructuredFieldKeyValue(modelTargetField)
+    ? modelTargetField
+    : requestedField;
+  const writeback = asRecord(input.suggested_writeback);
+  const hasWriteback =
+    input.suggested_writeback != null && Object.keys(writeback).length > 0;
+  const writebackField =
+    typeof writeback.field_key === "string" ? writeback.field_key : null;
+  const normalizedWritebackField = isStructuredFieldKeyValue(writebackField)
+    ? writebackField
+    : targetField;
+
+  return {
+    ...input,
+    target_field: targetField,
+    suggested_writeback: hasWriteback
+      ? normalizedWritebackField
+        ? {
+            ...writeback,
+            field_key: normalizedWritebackField,
+          }
+        : null
+      : input.suggested_writeback,
+  };
+}
+
 function buildFallbackQuestionRefinement(input: {
   ir: DocumentIR;
   blockId: string | null;
@@ -290,7 +355,11 @@ function buildFallbackQuestionRefinement(input: {
       input.targetField
     : "当前字段";
   const seed =
-    input.questionSeed?.trim() ||
+    buildGuidedQuestionSeed({
+      fieldKey: input.targetField,
+      seed: input.questionSeed,
+      gapReason: input.gapReason,
+    }) ||
     `请基于当前证据补充“${fieldLabel}”的专家判断。`;
   const gap = input.gapReason?.trim() || "缺少明确的专家补充说明";
   const contextSummary = evidenceBlocks
@@ -310,6 +379,9 @@ function classifyAgentLlmError(err: unknown): {
   message: string;
 } {
   const message = err instanceof Error ? err.message : String(err);
+  if (err instanceof SyntaxError) {
+    return { reason: "json_parse_error", message };
+  }
   if (/Timeout|aborted|AbortError/i.test(message)) {
     return { reason: "timeout", message };
   }
@@ -331,6 +403,8 @@ function isQaFallbackRetryable(reason: string, message: string) {
     reason === "timeout" ||
     reason === "http_error" ||
     reason === "empty_response" ||
+    reason === "json_parse_error" ||
+    reason === "schema_validation_error" ||
     /fetch failed|ECONNRESET|socket hang up|network/i.test(message)
   );
 }
@@ -392,6 +466,50 @@ async function chatCompletionTextWithQaFallback(opts: {
   }
 }
 
+async function retryQuestionRefinementWithDashScope(input: {
+  system: string;
+  user: string;
+  timeoutMs: number;
+  reason: string;
+  message: string;
+}): Promise<{
+  raw: string;
+  label: string;
+  provider: LlmProvider;
+  timeoutMs: number;
+  startedAt: number;
+}> {
+  if (
+    !hasDashScopeFallbackConfig() ||
+    !isQaFallbackRetryable(input.reason, input.message)
+  ) {
+    throw new Error(input.message);
+  }
+  const fallbackLabel = "qa.refine_question.fallback_dashscope";
+  console.info("[EBS LLM fallback]", {
+    from: "qa.refine_question",
+    to: fallbackLabel,
+    provider: "dashscope",
+    reason: input.reason,
+    message: input.message,
+  });
+  const startedAt = Date.now();
+  const raw = await chatCompletionText({
+    system: input.system,
+    user: input.user,
+    timeoutMs: input.timeoutMs,
+    label: fallbackLabel,
+    provider: "dashscope",
+  });
+  return {
+    raw,
+    label: fallbackLabel,
+    provider: "dashscope",
+    timeoutMs: input.timeoutMs,
+    startedAt,
+  };
+}
+
 function buildLlmCallDiagnostics(input: {
   label: string;
   system: string;
@@ -447,12 +565,14 @@ export async function runQuestionRefinementAsync(input: {
   if (process.env.EBS_LLM_QA?.trim() === "0") return fallback();
 
   const evidenceBlocks = evidenceBlocksForInput(input);
+  const questionGuidance = guidanceForField(input.targetField);
   const related = relatedDraftForBlocks(
     input.draft,
     evidenceBlocks.map((block) => block.block_id),
   );
   const system = `你是 Expert Brain Studio 的问题改写 Agent。你只负责把系统推荐追问、原文证据、目标字段和 GAP 原因改写成一个专家可确认的问题草稿，不回答问题。
 使用中文，问题要具体、友好、可回写导向。
+参考字段话术的提问角度，不要机械照抄；保留目标字段、证据 block 和 GAP 约束，确保问题可回写到目标字段。
 结合专家画像：${JSON.stringify(input.expertMemory?.profile ?? {})}
 输出 JSON，字段：
 - refined_question: 改写后的问题草稿
@@ -463,6 +583,7 @@ export async function runQuestionRefinementAsync(input: {
     {
       recommended_question: input.questionSeed,
       target_field: input.targetField,
+      question_guidance_examples: questionGuidance?.examples.slice(0, 3) ?? [],
       gap_reason: input.gapReason,
       low_score_metric: input.metric,
       evidence_blocks: compactEvidenceBlocks(evidenceBlocks),
@@ -471,6 +592,14 @@ export async function runQuestionRefinementAsync(input: {
     null,
     2,
   );
+  const parseQuestionRefinement = (raw: string): QuestionRefinementResponse => {
+    const parsed = extractJsonValue(raw);
+    const checked = QuestionRefinementResponseSchema.safeParse(parsed);
+    if (!checked.success) {
+      throw new Error("LLM response did not match QuestionRefinementResponseSchema");
+    }
+    return checked.data;
+  };
   try {
     const label = "qa.refine_question";
     const config = resolveLlmRequestConfig({ label });
@@ -481,11 +610,10 @@ export async function runQuestionRefinementAsync(input: {
       timeoutMs: config.timeoutMs,
       label,
     });
-    const parsed = JSON.parse(raw.trim()) as unknown;
-    const checked = QuestionRefinementResponseSchema.safeParse(parsed);
-    if (checked.success) {
+    try {
+      const checked = parseQuestionRefinement(raw);
       return {
-        ...checked.data,
+        ...checked,
         llm_diagnostics: buildLlmCallDiagnostics({
           label,
           system,
@@ -494,24 +622,141 @@ export async function runQuestionRefinementAsync(input: {
           startedAt,
         }),
       };
+    } catch (parseErr) {
+      const failure =
+        parseErr instanceof SyntaxError
+          ? classifyAgentLlmError(parseErr)
+          : {
+              reason: "schema_validation_error",
+              message: parseErr instanceof Error ? parseErr.message : String(parseErr),
+            };
+      if (
+        !hasDashScopeFallbackConfig() ||
+        !isQaFallbackRetryable(failure.reason, failure.message)
+      ) {
+        return {
+          ...fallback(),
+          llm_diagnostics: buildLlmCallDiagnostics({
+            label,
+            system,
+            user,
+            timeoutMs: config.timeoutMs,
+            startedAt,
+            status: "failed",
+            reason: failure.reason,
+            message: failure.message,
+          }),
+        };
+      }
+      let completion: Awaited<
+        ReturnType<typeof retryQuestionRefinementWithDashScope>
+      >;
+      try {
+        completion = await retryQuestionRefinementWithDashScope({
+          system,
+          user,
+          timeoutMs: config.timeoutMs,
+          reason: failure.reason,
+          message: failure.message,
+        });
+      } catch (fallbackErr) {
+        const fallbackFailure = classifyAgentLlmError(fallbackErr);
+        return {
+          ...fallback(),
+          llm_diagnostics: buildLlmCallDiagnostics({
+            label: "qa.refine_question.fallback_dashscope",
+            system,
+            user,
+            timeoutMs: config.timeoutMs,
+            provider: "dashscope",
+            status: "failed",
+            reason: fallbackFailure.reason,
+            message: fallbackFailure.message,
+          }),
+        };
+      }
+      try {
+        const checked = parseQuestionRefinement(completion.raw);
+        return {
+          ...checked,
+          llm_diagnostics: buildLlmCallDiagnostics({
+            label: completion.label,
+            system,
+            user,
+            timeoutMs: completion.timeoutMs,
+            provider: completion.provider,
+            startedAt: completion.startedAt,
+          }),
+        };
+      } catch (fallbackParseErr) {
+        const fallbackFailure =
+          fallbackParseErr instanceof SyntaxError
+            ? classifyAgentLlmError(fallbackParseErr)
+            : {
+                reason: "schema_validation_error",
+                message:
+                  fallbackParseErr instanceof Error
+                    ? fallbackParseErr.message
+                    : String(fallbackParseErr),
+              };
+        return {
+          ...fallback(),
+          llm_diagnostics: buildLlmCallDiagnostics({
+            label: completion.label,
+            system,
+            user,
+            timeoutMs: completion.timeoutMs,
+            provider: completion.provider,
+            startedAt: completion.startedAt,
+            status: "failed",
+            reason: fallbackFailure.reason,
+            message: fallbackFailure.message,
+          }),
+        };
+      }
     }
-    return {
-      ...fallback(),
-      llm_diagnostics: buildLlmCallDiagnostics({
-        label,
-        system,
-        user,
-        timeoutMs: config.timeoutMs,
-        startedAt,
-        status: "failed",
-        reason: "schema_validation_error",
-        message: "LLM response did not match QuestionRefinementResponseSchema",
-      }),
-    };
   } catch (err) {
     const label = "qa.refine_question";
     const config = resolveLlmRequestConfig({ label });
     const { reason, message } = classifyAgentLlmError(err);
+    if (hasDashScopeFallbackConfig() && isQaFallbackRetryable(reason, message)) {
+      try {
+        const completion = await retryQuestionRefinementWithDashScope({
+          system,
+          user,
+          timeoutMs: config.timeoutMs,
+          reason,
+          message,
+        });
+        const checked = parseQuestionRefinement(completion.raw);
+        return {
+          ...checked,
+          llm_diagnostics: buildLlmCallDiagnostics({
+            label: completion.label,
+            system,
+            user,
+            timeoutMs: completion.timeoutMs,
+            provider: completion.provider,
+            startedAt: completion.startedAt,
+          }),
+        };
+      } catch (fallbackErr) {
+        const fallbackFailure = classifyAgentLlmError(fallbackErr);
+        return {
+          ...fallback(),
+          llm_diagnostics: buildLlmCallDiagnostics({
+            label: "qa.refine_question.fallback_dashscope",
+            system,
+            user,
+            timeoutMs: config.timeoutMs,
+            provider: "dashscope",
+            status: "failed",
+            reason: fallbackFailure.reason,
+            message: fallbackFailure.message,
+          }),
+        };
+      }
+    }
     return {
       ...fallback(),
       llm_diagnostics: buildLlmCallDiagnostics({
@@ -587,14 +832,16 @@ export async function runDocQAAsync(input: {
 当 qa_mode 是 direct_qa 时，直接回答用户 question，不要把自由提问强制改写成任务追问；refined_question 可以省略或仅复述一个更清晰的问题。
 当 qa_mode 是 task_refine_then_qa 时，可以基于 recommended_question、evidence_blocks、target_field 和 gap_reason 生成更具体的 refined_question 后再回答。
 无论哪种模式，都要尽量输出可写入 Ground Truth 草稿的 suggested_writeback；只有证据确实不足时才返回 null。
+target_field 和 suggested_writeback.field_key 只能从这些合法字段中选择：${STRUCTURED_FIELD_KEY_LIST}。不要输出 definitions、terms、notes 等非 schema 字段；无法判断字段时返回 null。
+suggested_writeback.content 必须短小，优先 1 段话或不超过 5 条短项目，避免长 Markdown 和嵌套对象。
 输出 JSON，字段：
 - refined_question: 你基于推荐追问和证据生成的具体业务问题
 - direct_answer: 直接答案
 - rationale: 推理依据，说明引用了哪些原文和结构化字段
 - source_block_refs: 字符串数组
 - next_step_suggestion: 下一步建议
-- target_field: 若适合回写，给出目标字段；否则 null
-- suggested_writeback: 可选，{ field_key, content }`;
+- target_field: 合法字段名或 null
+- suggested_writeback: 可选，{ field_key: 合法字段名, content: 短文本或短列表 }`;
   const user = JSON.stringify(
     {
       question: input.question,
@@ -618,7 +865,10 @@ export async function runDocQAAsync(input: {
       timeoutMs: config.timeoutMs,
       label,
     });
-    const parsed = JSON.parse(completion.raw.trim()) as unknown;
+    const parsed = normalizeQaResponsePayload(
+      extractJsonValue(completion.raw),
+      input.targetField,
+    );
     const checked = QAResponseSchema.safeParse(parsed);
     if (checked.success) {
       return {

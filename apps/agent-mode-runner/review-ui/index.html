@@ -1,0 +1,1839 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>智能文档批改工作台</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f0e6;
+        --paper: #fffdf8;
+        --panel: #ffffff;
+        --text: #1f2933;
+        --muted: #6c756c;
+        --line: rgba(31, 41, 51, 0.1);
+        --accent: #204b3a;
+        --accent2: #b8792f;
+        --danger: #b84b3f;
+        --warn: #c9862e;
+        --ok: #2f7a55;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(184, 121, 47, 0.15), transparent 32%),
+          linear-gradient(135deg, #f8f3e9, #ece7db);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+      }
+
+      button,
+      select {
+        font: inherit;
+      }
+
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 18px;
+        align-items: center;
+        padding: 16px 22px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 253, 248, 0.86);
+        backdrop-filter: blur(16px);
+      }
+
+      .topbar span {
+        color: var(--accent2);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .topbar h1 {
+        margin: 4px 0 0;
+        font-size: 22px;
+        letter-spacing: -0.03em;
+      }
+
+      .toolbar {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+
+      select,
+      button {
+        border: 1px solid rgba(32, 75, 58, 0.18);
+        border-radius: 999px;
+        background: #fff;
+        color: var(--text);
+        padding: 8px 12px;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns:
+          minmax(280px, var(--source-width, 1.08fr))
+          10px
+          minmax(320px, var(--navigator-width, 0.58fr))
+          10px
+          minmax(320px, var(--review-width, 0.78fr));
+        gap: 8px;
+        height: calc(100vh - 74px);
+        padding: 18px;
+      }
+
+      .layout.navigator-expanded {
+        grid-template-columns:
+          minmax(220px, var(--source-width, 280px))
+          10px
+          minmax(520px, var(--navigator-width, 1fr))
+          10px
+          minmax(300px, var(--review-width, 360px));
+      }
+
+      .layout.is-resizing {
+        cursor: col-resize;
+        user-select: none;
+      }
+
+      .resize-handle {
+        align-self: stretch;
+        width: 10px;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background:
+          linear-gradient(90deg, transparent 0 3px, rgba(32, 75, 58, 0.16) 3px 7px, transparent 7px);
+        cursor: col-resize;
+      }
+
+      .resize-handle:hover,
+      .resize-handle:focus-visible {
+        background:
+          linear-gradient(90deg, transparent 0 2px, rgba(32, 75, 58, 0.38) 2px 8px, transparent 8px);
+        outline: none;
+      }
+
+      .pane {
+        min-width: 0;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        background: rgba(255, 253, 248, 0.78);
+        box-shadow: 0 20px 60px rgba(70, 80, 92, 0.08);
+      }
+
+      .source-pane,
+      .navigator-pane,
+      .review-pane {
+        padding: 16px;
+      }
+
+      .source-header,
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        background: var(--panel);
+        box-shadow: 0 12px 34px rgba(70, 80, 92, 0.06);
+      }
+
+      .source-header {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 14px;
+        margin-bottom: 14px;
+        padding: 16px;
+      }
+
+      .kicker {
+        color: var(--accent2);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      h2,
+      h3 {
+        margin: 4px 0 8px;
+      }
+
+      p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.65;
+      }
+
+      .stats {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 4px 8px;
+        align-content: center;
+        min-width: 168px;
+        padding: 10px;
+        border-radius: 16px;
+        background: rgba(245, 240, 230, 0.74);
+      }
+
+      .stats strong {
+        font-size: 18px;
+      }
+
+      .stats span {
+        align-self: center;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .reading-flow {
+        display: grid;
+        gap: 10px;
+        max-width: 980px;
+        margin: 0 auto;
+      }
+
+      .block {
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--paper);
+        transition:
+          border-color 0.16s ease,
+          box-shadow 0.16s ease,
+          transform 0.16s ease;
+      }
+
+      .block:hover {
+        transform: translateY(-1px);
+      }
+
+      .block.active,
+      .block.linked,
+      .block.unit-linked {
+        border-color: rgba(32, 75, 58, 0.48);
+        box-shadow: 0 0 0 3px rgba(32, 75, 58, 0.1);
+      }
+
+      .block.unit-linked {
+        background: rgba(245, 250, 247, 0.92);
+      }
+
+      .block-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+
+      .chip {
+        display: inline-flex;
+        gap: 4px;
+        align-items: center;
+        padding: 4px 8px;
+        border-radius: 999px;
+        color: var(--muted);
+        background: rgba(237, 242, 240, 0.9);
+        border: 1px solid rgba(31, 41, 51, 0.06);
+        font-size: 11px;
+      }
+
+      .block-body {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(130px, 0.22fr);
+        gap: 12px;
+      }
+
+      .block-content h2,
+      .block-content h3,
+      .block-content h4 {
+        margin: 0;
+      }
+
+      .block-content p,
+      .block-content pre {
+        margin: 0;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        line-height: 1.75;
+      }
+
+      .tag-list {
+        display: grid;
+        gap: 7px;
+      }
+
+      .semantic-unit-note {
+        display: grid;
+        gap: 6px;
+        margin-top: 10px;
+        padding: 10px;
+        border: 1px solid rgba(32, 75, 58, 0.14);
+        border-radius: 14px;
+        background: rgba(237, 242, 240, 0.64);
+      }
+
+      .semantic-unit-note strong {
+        font-size: 12px;
+      }
+
+      .semantic-unit-note p {
+        font-size: 12px;
+      }
+
+      .tag {
+        display: grid;
+        gap: 2px;
+        padding: 7px 9px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: rgba(245, 240, 230, 0.78);
+        text-align: left;
+      }
+
+      .tag strong {
+        font-size: 12px;
+      }
+
+      .tag span {
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .tag.covered {
+        background: rgba(47, 122, 85, 0.12);
+        border-color: rgba(47, 122, 85, 0.22);
+      }
+
+      .tag.missing,
+      .field.missing {
+        background: rgba(184, 75, 63, 0.08);
+        border-color: rgba(184, 75, 63, 0.22);
+      }
+
+      .tag.weak,
+      .tag.needs_confirmation,
+      .tag.inferred {
+        background: rgba(201, 134, 46, 0.12);
+        border-color: rgba(201, 134, 46, 0.24);
+      }
+
+      .card {
+        display: grid;
+        gap: 10px;
+        margin-bottom: 14px;
+        padding: 16px;
+      }
+
+      .card header {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .summary-grid,
+      .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+        gap: 8px;
+      }
+
+      .mini-card,
+      .metric {
+        display: grid;
+        gap: 4px;
+        padding: 10px;
+        border-radius: 14px;
+        background: rgba(245, 240, 230, 0.62);
+      }
+
+      .risk-list,
+      .spine-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .field-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .navigator-root {
+        display: grid;
+        gap: 12px;
+      }
+
+      .navigator-header {
+        display: grid;
+        gap: 8px;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--panel);
+      }
+
+      .navigator-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .navigator-actions button.active {
+        color: #fff;
+        background: var(--accent);
+      }
+
+      .field-tree {
+        display: grid;
+        gap: 10px;
+      }
+
+      .field-node {
+        display: grid;
+        gap: 8px;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: rgba(255, 253, 248, 0.92);
+        text-align: left;
+      }
+
+      .field-node.active {
+        border-color: rgba(32, 75, 58, 0.44);
+        background: rgba(47, 122, 85, 0.08);
+      }
+
+      .unit-node,
+      .block-node {
+        display: grid;
+        gap: 4px;
+        width: 100%;
+        border-radius: 12px;
+        text-align: left;
+      }
+
+      .unit-node {
+        padding: 9px;
+        background: rgba(237, 242, 240, 0.72);
+      }
+
+      .unit-node.active {
+        border-color: rgba(32, 75, 58, 0.42);
+        background: rgba(47, 122, 85, 0.12);
+      }
+
+      .block-node {
+        padding: 7px 9px;
+        color: var(--muted);
+        background: rgba(255, 255, 255, 0.72);
+      }
+
+      .field {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 4px 10px;
+        padding: 11px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: rgba(250, 248, 243, 0.82);
+        text-align: left;
+      }
+
+      .field.active {
+        border-color: rgba(32, 75, 58, 0.44);
+        background: rgba(47, 122, 85, 0.08);
+      }
+
+      .field p {
+        grid-column: 1 / -1;
+        font-size: 12px;
+      }
+
+      .hint {
+        padding: 12px;
+        border: 1px solid rgba(184, 75, 63, 0.16);
+        border-radius: 16px;
+        background: rgba(255, 248, 240, 0.8);
+      }
+
+      .hint + .hint {
+        margin-top: 10px;
+      }
+
+      .summary-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .focus-list,
+      .method-list {
+        display: grid;
+        gap: 8px;
+        margin: 0;
+        padding-left: 18px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      .debug-details {
+        border: 1px dashed rgba(31, 41, 51, 0.16);
+        border-radius: 16px;
+        padding: 10px;
+        color: var(--muted);
+      }
+
+      .debug-details summary {
+        cursor: pointer;
+      }
+
+      .drawer-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 30;
+        display: grid;
+        justify-items: end;
+        background: rgba(31, 41, 51, 0.2);
+        backdrop-filter: blur(4px);
+      }
+
+      .debug-drawer {
+        width: min(720px, 92vw);
+        height: 100vh;
+        overflow: auto;
+        padding: 18px;
+        border-left: 1px solid var(--line);
+        background: #fffdf8;
+        box-shadow: -24px 0 70px rgba(31, 41, 51, 0.18);
+      }
+
+      .debug-drawer header {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: flex-start;
+        margin-bottom: 14px;
+      }
+
+      .debug-section {
+        display: grid;
+        gap: 8px;
+        margin: 12px 0;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: rgba(245, 240, 230, 0.52);
+      }
+
+      .debug-section pre {
+        max-height: 260px;
+        overflow: auto;
+        margin: 0;
+        padding: 12px;
+        border-radius: 12px;
+        color: #243126;
+        background: rgba(255, 255, 255, 0.76);
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.55;
+      }
+
+      .patch-card {
+        display: grid;
+        gap: 8px;
+        padding: 12px;
+        border: 1px solid rgba(32, 75, 58, 0.16);
+        border-radius: 16px;
+        background: rgba(245, 250, 247, 0.86);
+      }
+
+      .patch-card + .patch-card {
+        margin-top: 10px;
+      }
+
+      .patch-card blockquote {
+        margin: 0;
+        padding: 10px 12px;
+        border-left: 3px solid rgba(32, 75, 58, 0.36);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.78);
+        color: var(--text);
+        line-height: 1.65;
+      }
+
+      .plan-card {
+        border-color: rgba(184, 121, 47, 0.22);
+        background: rgba(255, 251, 243, 0.94);
+      }
+
+      .inline-error {
+        display: grid;
+        gap: 6px;
+        padding: 10px 12px;
+        border: 1px solid rgba(184, 75, 63, 0.2);
+        border-radius: 14px;
+        background: rgba(255, 241, 239, 0.74);
+      }
+
+      .inline-error strong {
+        color: var(--danger);
+      }
+
+      .table-frame {
+        overflow-x: auto;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: rgba(245, 240, 230, 0.72);
+      }
+
+      table {
+        width: 100%;
+        min-width: 420px;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+
+      th,
+      td {
+        padding: 8px;
+        border: 1px solid var(--line);
+        text-align: left;
+      }
+
+      .empty {
+        padding: 24px;
+        color: var(--muted);
+      }
+
+      @media (max-width: 980px) {
+        .layout {
+          grid-template-columns: 1fr;
+          height: auto;
+        }
+
+        .resize-handle {
+          display: none;
+        }
+
+        .pane {
+          max-height: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <span>文档批改</span>
+        <h1>第一阶段文档批改工作台</h1>
+      </div>
+      <div class="toolbar">
+        <select id="runSelect" aria-label="选择批改记录"></select>
+        <button id="reloadButton" type="button">刷新</button>
+      </div>
+    </header>
+    <main id="workspaceLayout" class="layout">
+      <section class="pane source-pane">
+        <div id="sourceRoot" class="empty">正在加载批改结果...</div>
+      </section>
+      <button class="resize-handle" type="button" data-resize-handle="source-navigator" aria-label="拖拽调整宽度：原文与标签导航"></button>
+      <section class="pane navigator-pane">
+        <div id="navigatorRoot" class="empty">正在加载标签导航...</div>
+      </section>
+      <button class="resize-handle" type="button" data-resize-handle="navigator-review" aria-label="拖拽调整宽度：标签导航与详情"></button>
+      <section class="pane review-pane">
+        <div id="reviewRoot" class="empty">正在加载批改数据...</div>
+      </section>
+    </main>
+    <script>
+      const state = {
+        runs: [],
+        payload: null,
+        selectedRunId: new URLSearchParams(location.search).get("run_id"),
+        activeField: null,
+        activeBlock: null,
+        activeSemanticUnitId: null,
+        navigatorExpanded: new URL(location.href).searchParams.get("view") === "tag-navigator",
+        layoutWidths: null,
+        showMissingOnly: false,
+        focusCurrentUnitOnly: false,
+        summaryGenerating: false,
+        optimizationGenerating: false,
+        optimizationPreviewGenerating: false,
+        optimizationClientError: "",
+        llmDrawerOpen: false,
+        llmDrawerSource: "expert_summary",
+      };
+
+      const fieldStatusLabels = {
+        covered: "已说明",
+        missing: "待补充",
+        weak_source: "依据不足",
+        needs_confirmation: "需专家确认",
+        inferred_candidate: "系统推测",
+      };
+
+      const tagStatusLabels = {
+        covered: "已说明",
+        missing: "待补充",
+        weak: "依据不足",
+        needs_confirmation: "需确认",
+        inferred: "系统推测",
+      };
+
+      const blockTypeLabels = {
+        heading: "标题",
+        paragraph: "段落",
+        list: "列表",
+        table: "表格",
+        image: "图片",
+        outline: "大纲",
+      };
+
+      const roleDescriptions = {
+        overview_statement: "用于说明整篇文档的总观点或方法定位。",
+        business_definition: "用于界定业务场景、适用对象或方法定义。",
+        process_model: "用于呈现方法主线、流程框架或维度拆解。",
+        metric_basis: "用于说明判断所依赖的数据、指标或观察信号。",
+        diagnosis_issue: "用于描述问题类型、异常表现或诊断对象。",
+        action_method: "用于说明可执行动作、处理方式或操作步骤。",
+        validation_rule: "用于说明判断标准、验证方式或复盘口径。",
+        boundary_condition: "用于说明触发、终止、例外或不适用边界。",
+        supporting_detail: "用于补充背景、案例、模板或交付说明。",
+        unknown: "系统暂未判断出明确作用，建议专家人工确认。",
+      };
+
+      const priorityLabels = {
+        high: "优先补充",
+        medium: "建议补充",
+        low: "可后续完善",
+      };
+
+      const sourceLabels = {
+        evidence_map: "系统引用",
+        draft_source_refs: "已写入草稿",
+        diagnostic: "质量检查",
+      };
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      async function fetchJson(url, options) {
+        const res = await fetch(url, options);
+        if (!res.ok) throw new Error(await res.text());
+        return res.json();
+      }
+
+      const layoutMinWidths = {
+        source: 260,
+        navigator: 320,
+        review: 300,
+      };
+
+      function layoutStorageKey() {
+        return state.navigatorExpanded
+          ? "agentReviewLayoutWidths:tagNavigator"
+          : "agentReviewLayoutWidths:default";
+      }
+
+      function suggestedLayoutWidths() {
+        const layout = document.getElementById("workspaceLayout");
+        const available = Math.max(920, (layout?.clientWidth || window.innerWidth) - 20);
+        if (state.navigatorExpanded) {
+          const source = 280;
+          const review = 360;
+          return {
+            source,
+            navigator: Math.max(520, available - source - review),
+            review,
+          };
+        }
+        const source = Math.max(360, Math.round(available * 0.42));
+        const navigator = Math.max(340, Math.round(available * 0.3));
+        return {
+          source,
+          navigator,
+          review: Math.max(340, available - source - navigator),
+        };
+      }
+
+      function clampLayoutWidths(widths) {
+        return {
+          source: Math.max(layoutMinWidths.source, Math.round(widths.source || 0)),
+          navigator: Math.max(layoutMinWidths.navigator, Math.round(widths.navigator || 0)),
+          review: Math.max(layoutMinWidths.review, Math.round(widths.review || 0)),
+        };
+      }
+
+      function loadLayoutWidths() {
+        try {
+          const saved = JSON.parse(localStorage.getItem(layoutStorageKey()) || "null");
+          if (saved?.source && saved?.navigator && saved?.review) {
+            return clampLayoutWidths(saved);
+          }
+        } catch {
+          // Ignore corrupted local layout preferences and fall back to defaults.
+        }
+        return suggestedLayoutWidths();
+      }
+
+      function setLayoutWidths(widths, options = {}) {
+        const layout = document.getElementById("workspaceLayout");
+        if (!layout) return;
+        state.layoutWidths = clampLayoutWidths(widths);
+        layout.style.setProperty("--source-width", `${state.layoutWidths.source}px`);
+        layout.style.setProperty("--navigator-width", `${state.layoutWidths.navigator}px`);
+        layout.style.setProperty("--review-width", `${state.layoutWidths.review}px`);
+        if (options.persist) {
+          localStorage.setItem(layoutStorageKey(), JSON.stringify(state.layoutWidths));
+        }
+      }
+
+      function applyLayoutState() {
+        const layout = document.getElementById("workspaceLayout");
+        if (!layout) return;
+        layout.classList.toggle("navigator-expanded", state.navigatorExpanded);
+        setLayoutWidths(state.layoutWidths || loadLayoutWidths());
+      }
+
+      function toggleNavigatorView() {
+        state.navigatorExpanded = !state.navigatorExpanded;
+        state.layoutWidths = suggestedLayoutWidths();
+        const url = new URL(location.href);
+        if (state.navigatorExpanded) {
+          url.searchParams.set("view", "tag-navigator");
+        } else {
+          url.searchParams.delete("view");
+        }
+        history.replaceState(null, "", url);
+        setLayoutWidths(state.layoutWidths, { persist: true });
+        renderAll();
+      }
+
+      function initResizableLayout() {
+        const layout = document.getElementById("workspaceLayout");
+        if (!layout) return;
+        document.querySelectorAll("[data-resize-handle]").forEach((handle) => {
+          handle.addEventListener("pointerdown", (event) => {
+            if (!state.layoutWidths) state.layoutWidths = loadLayoutWidths();
+            const startX = event.clientX;
+            const start = { ...state.layoutWidths };
+            const kind = handle.getAttribute("data-resize-handle");
+            layout.classList.add("is-resizing");
+            handle.setPointerCapture?.(event.pointerId);
+            const onMove = (moveEvent) => {
+              const dx = moveEvent.clientX - startX;
+              if (kind === "source-navigator") {
+                const total = start.source + start.navigator;
+                const source = Math.min(
+                  total - layoutMinWidths.navigator,
+                  Math.max(layoutMinWidths.source, start.source + dx),
+                );
+                setLayoutWidths({
+                  source,
+                  navigator: total - source,
+                  review: start.review,
+                });
+              } else {
+                const total = start.navigator + start.review;
+                const navigator = Math.min(
+                  total - layoutMinWidths.review,
+                  Math.max(layoutMinWidths.navigator, start.navigator + dx),
+                );
+                setLayoutWidths({
+                  source: start.source,
+                  navigator,
+                  review: total - navigator,
+                });
+              }
+            };
+            const onUp = () => {
+              layout.classList.remove("is-resizing");
+              setLayoutWidths(state.layoutWidths || start, { persist: true });
+              window.removeEventListener("pointermove", onMove);
+              window.removeEventListener("pointerup", onUp);
+            };
+            window.addEventListener("pointermove", onMove);
+            window.addEventListener("pointerup", onUp, { once: true });
+          });
+        });
+      }
+
+      function parseTable(text) {
+        const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+        if (lines.length < 2 || !lines.every((line) => line.includes("|"))) return null;
+        const rows = lines
+          .map((line) =>
+            line
+              .replace(/^\|/, "")
+              .replace(/\|$/, "")
+              .split("|")
+              .map((cell) => cell.trim()),
+          )
+          .filter((row) => !row.every((cell) => /^:?-{3,}:?$/.test(cell)));
+        if (rows.length < 2) return null;
+        return { headers: rows[0], rows: rows.slice(1) };
+      }
+
+      function renderBlockContent(block) {
+        if (block.block_type === "table") {
+          const table = parseTable(block.text_content);
+          if (table) {
+            return `<div class="table-frame"><table><thead><tr>${table.headers
+              .map((header) => `<th>${escapeHtml(header)}</th>`)
+              .join("")}</tr></thead><tbody>${table.rows
+              .map(
+                (row) =>
+                  `<tr>${table.headers
+                    .map((_, index) => `<td>${escapeHtml(row[index] ?? "")}</td>`)
+                    .join("")}</tr>`,
+              )
+              .join("")}</tbody></table></div>`;
+          }
+        }
+        if (block.block_type === "heading") {
+          const level = Math.min(Math.max(block.heading_level || 2, 2), 4);
+          return `<h${level}>${escapeHtml(block.text_content)}</h${level}>`;
+        }
+        if (block.block_type === "list") return `<pre>${escapeHtml(block.text_content)}</pre>`;
+        return `<p>${escapeHtml(block.text_content)}</p>`;
+      }
+
+      function metricValueText(value) {
+        if (typeof value === "number") return Math.round(value * 100) + "%";
+        if (typeof value === "boolean") return value ? "是" : "否";
+        return value ?? "待评估";
+      }
+
+      function metricStatusText(status) {
+        if (status === "pass") return "已达标";
+        if (status === "warn") return "建议关注";
+        if (status === "fail") return "需要补强";
+        if (status === "skipped") return "暂未评估";
+        return "参考指标";
+      }
+
+      function metricExplanation(metric) {
+        const explanations = {
+          field_coverage: "核心要素是否已经讲全。",
+          raw_field_coverage: "基础文档要素是否已有内容。",
+          source_grounding_rate: "关键内容是否能回到原文依据。",
+          source_backed_item_rate: "识别出的内容是否有原文支撑。",
+          typed_validation_pass_rate: "内容是否符合预期结构。",
+          structural_consistency: "方法主线、步骤、判断和验证是否能连成闭环。",
+          gap_detection_accuracy: "系统识别出的缺口是否可信。",
+          inference_handling_accuracy: "系统推测内容是否被明确标记，避免当成确定事实。",
+          duplicate_tag_rate: "同一片段是否被重复标注。",
+          over_tagged_block_rate: "同一片段是否被标注得过多。",
+          primary_label_coverage: "原文片段是否都有清楚的主要作用。",
+          field_boundary_violation_count: "不同文档要素之间是否混在一起。",
+          overview_block_overclaim_rate: "总述性内容是否被过度当成具体依据。",
+          structured_summary_coverage: "文档总结是否覆盖主要章节。",
+          contextualized_block_coverage: "原文片段是否带有上下文理解。",
+          structured_summary_grounding_rate: "总结是否能追溯到原文。",
+          semantic_unit_coverage: "格式段落是否都被纳入清晰的语义单元。",
+          fragmented_thought_rate: "完整想法是否仍被系统拆成多个独立判断。",
+          merge_confidence: "系统把相邻段落视为同一语义整体的把握程度。",
+        };
+        return explanations[metric.key] || "用于辅助判断文档当前质量。";
+      }
+
+      function tagsForBlock(blockId) {
+        return (state.payload?.block_tags ?? []).filter((tag) => tag.block_id === blockId);
+      }
+
+      function annotationForBlock(blockId) {
+        const annotation = (state.payload?.block_annotations ?? []).find(
+          (item) => item.block_id === blockId,
+        );
+        if (annotation) return annotation;
+        const tags = tagsForBlock(blockId);
+        return {
+          block_id: blockId,
+          primary_role: "unknown",
+          primary_label: "上下文片段",
+          supporting_field_refs: tags.map((tag) => ({
+            field_key: tag.field_key,
+            label: tag.label,
+            status: tag.status,
+            sources: tag.sources || [tag.source].filter(Boolean),
+          })),
+          confidence: 0,
+          reason: "系统暂未判断出这个片段的明确作用。",
+        };
+      }
+
+      function unitTagsForBlock(blockId) {
+        const annotation = annotationForBlock(blockId);
+        return annotation.unit_supporting_field_refs?.length
+          ? annotation.unit_supporting_field_refs
+          : annotation.supporting_field_refs || [];
+      }
+
+      function blockById(blockId) {
+        return (state.payload?.document.blocks ?? []).find((block) => block.block_id === blockId);
+      }
+
+      function semanticUnitById(unitId) {
+        return (state.payload?.semantic_units ?? []).find((unit) => unit.unit_id === unitId);
+      }
+
+      function fieldEvidenceGroups(payload) {
+        const annotations = payload.block_annotations || [];
+        const blocks = payload.document.blocks || [];
+        const annotationsByUnit = new Map();
+        const annotationsByBlock = new Map(annotations.map((annotation) => [annotation.block_id, annotation]));
+        for (const annotation of annotations) {
+          if (!annotation.semantic_unit_id) continue;
+          const list = annotationsByUnit.get(annotation.semantic_unit_id) || [];
+          list.push(annotation);
+          annotationsByUnit.set(annotation.semantic_unit_id, list);
+        }
+        return (payload.schema_fields || []).map((field) => {
+          const relatedAnnotations = annotations.filter((annotation) => {
+            const refs = annotation.unit_supporting_field_refs?.length
+              ? annotation.unit_supporting_field_refs
+              : annotation.supporting_field_refs || [];
+            return refs.some((ref) => ref.field_key === field.field_key);
+          });
+          const unitIds = [
+            ...(field.semantic_unit_ids || []),
+            ...relatedAnnotations.map((annotation) => annotation.semantic_unit_id).filter(Boolean),
+          ];
+          const uniqueUnitIds = [...new Set(unitIds)];
+          const units = uniqueUnitIds.map((unitId) => {
+            const unit = semanticUnitById(unitId);
+            const unitAnnotations = annotationsByUnit.get(unitId) || [];
+            const sourceBlockIds = unit?.source_block_ids?.length
+              ? unit.source_block_ids
+              : unitAnnotations.map((annotation) => annotation.block_id);
+            return {
+              unit_id: unitId,
+              summary: unit?.summary || unitAnnotations[0]?.semantic_unit_summary || "这组段落共同说明一个文档要素。",
+              continuity_reason: unitAnnotations.find((annotation) => annotation.continuity_reason)?.continuity_reason,
+              source_block_ids: [...new Set(sourceBlockIds)],
+              blocks: [...new Set(sourceBlockIds)]
+                .map((blockId) => blockById(blockId))
+                .filter(Boolean),
+            };
+          });
+          const directBlockIds = [
+            ...(field.source_block_ids || []),
+            ...relatedAnnotations.map((annotation) => annotation.block_id),
+          ];
+          const unitBlockIds = new Set(units.flatMap((unit) => unit.source_block_ids));
+          const fallbackBlocks = [...new Set(directBlockIds)]
+            .filter((blockId) => !unitBlockIds.has(blockId))
+            .map((blockId) => annotationsByBlock.get(blockId)?.block_id ? blockById(blockId) : blockById(blockId))
+            .filter(Boolean);
+          return {
+            field,
+            units,
+            fallbackBlocks,
+            evidence_count: units.reduce((sum, unit) => sum + unit.source_block_ids.length, 0) + fallbackBlocks.length,
+          };
+        });
+      }
+
+      function renderLlmDrawer(observability, title, emptyText, options = {}) {
+        if (!state.llmDrawerOpen) return "";
+        const parsedResult = observability?.parsed_result || observability?.parsed_summary || {};
+        const drawerKicker = options.kicker || "LLM 调用观测";
+        const systemLabel = options.systemLabel || "系统提示词";
+        const inputLabel = options.inputLabel || "用户提示词";
+        const outputLabel = options.outputLabel || "原始返回";
+        const parsedLabel = options.parsedLabel || "解析结果";
+        const extraDebugSection = options.extraDebugSection || "";
+        if (!observability) {
+          return `<aside class="drawer-backdrop" data-drawer-backdrop>
+            <section class="debug-drawer">
+              <header>
+                <div><span class="kicker">${escapeHtml(drawerKicker)}</span><h2>${escapeHtml(title)}</h2></div>
+                <button type="button" data-close-llm-drawer>关闭</button>
+              </header>
+              <p>${escapeHtml(emptyText)}</p>
+            </section>
+          </aside>`;
+        }
+        return `<aside class="drawer-backdrop" data-drawer-backdrop>
+          <section class="debug-drawer">
+            <header>
+              <div><span class="kicker">${escapeHtml(drawerKicker)}</span><h2>${escapeHtml(title)}</h2></div>
+              <button type="button" data-close-llm-drawer>关闭</button>
+            </header>
+            <div class="summary-grid">
+              <div class="mini-card"><span class="kicker">调用模型</span><strong>${escapeHtml(observability.model || "未知模型")}</strong></div>
+              <div class="mini-card"><span class="kicker">服务提供方</span><strong>${escapeHtml(observability.provider || "未知")}</strong></div>
+              <div class="mini-card"><span class="kicker">提示词长度</span><strong>${escapeHtml(observability.prompt_chars ?? "—")}</strong></div>
+              <div class="mini-card"><span class="kicker">返回长度</span><strong>${escapeHtml(observability.response_chars ?? "—")}</strong></div>
+            </div>
+            <section class="debug-section">
+              <span class="kicker">${escapeHtml(systemLabel)}</span>
+              <pre>${escapeHtml(observability.prompt?.system || "")}</pre>
+            </section>
+            <section class="debug-section">
+              <span class="kicker">${escapeHtml(inputLabel)}</span>
+              <pre>${escapeHtml(observability.prompt?.user || "")}</pre>
+            </section>
+            ${extraDebugSection}
+            <section class="debug-section">
+              <span class="kicker">${escapeHtml(outputLabel)}</span>
+              <pre>${escapeHtml(observability.raw_response || "")}</pre>
+            </section>
+            <section class="debug-section">
+              <span class="kicker">${escapeHtml(parsedLabel)}</span>
+              <pre>${escapeHtml(JSON.stringify(parsedResult, null, 2))}</pre>
+            </section>
+          </section>
+        </aside>`;
+      }
+
+      function renderContinuityTraceSection(trace) {
+        const decisions = trace?.decisions || [];
+        if (!decisions.length) return "";
+        const visibleDecisions = decisions.slice(0, 20).map((decision) => ({
+          from: decision.from_block_id,
+          to: decision.to_block_id,
+          decision: decision.should_merge ? "合并为同一语义单元" : "保留为独立语义单元",
+          relation: decision.relation,
+          signals: decision.signals,
+          rule_score: decision.rule_score,
+          embedding_similarity: decision.embedding_similarity,
+          final_score: decision.final_score,
+          reason: decision.merge_reason,
+        }));
+        return `<section class="debug-section">
+          <span class="kicker">语义连贯性判断</span>
+          <pre>${escapeHtml(JSON.stringify({
+            profile: trace.semantic_coherence_profile || "rules",
+            decisions: visibleDecisions,
+          }, null, 2))}</pre>
+        </section>`;
+      }
+
+      function renderOptimizationPlan(plan, error) {
+        if (!plan) return "";
+        const errorMessage = error?.message || state.optimizationClientError;
+        return `<section class="card plan-card">
+          <header>
+            <div><span class="kicker">优化计划</span><h3>${escapeHtml(plan.goal || "先确认优化方向")}</h3></div>
+            <div class="summary-actions">
+              <button type="button" data-open-plan-debug>查看生成过程</button>
+              <span class="chip">${escapeHtml(plan.status === "preview_ready" ? "预览已生成" : plan.status === "preview_failed" ? "预览生成失败" : "待确认")}</span>
+            </div>
+          </header>
+          <p>${escapeHtml(plan.summary || "系统已基于当前批改结果整理出待处理事项。")}</p>
+          ${
+            errorMessage
+              ? `<div class="inline-error">
+                  <strong>生成预览失败</strong>
+                  <p>${escapeHtml(errorMessage)}</p>
+                  ${error?.stage ? `<p>失败阶段：${escapeHtml(error.stage)}</p>` : ""}
+                  ${error?.raw_response_preview ? `<pre>${escapeHtml(error.raw_response_preview)}</pre>` : ""}
+                </div>`
+              : ""
+          }
+          <div>
+            <span class="kicker">待处理事项</span>
+            ${(plan.todos || [])
+              .map(
+                (todo) =>
+                  `<article class="patch-card">
+                    <header>
+                      <strong>${escapeHtml(todo.title)}</strong>
+                      <span class="chip">${escapeHtml(priorityLabels[todo.priority] || "建议补充")}</span>
+                    </header>
+                    <p><strong>文档要素：</strong>${escapeHtml(todo.target_field_label || "待确认")}</p>
+                    <p><strong>为什么要补：</strong>${escapeHtml(todo.reason || "这个要素会影响文档可执行性。")}</p>
+                    ${
+                      todo.semantic_unit_id
+                        ? `<p><strong>语义单元：</strong>${escapeHtml(todo.semantic_unit_id)}</p>`
+                        : ""
+                    }
+                    ${
+                      todo.semantic_segment_id
+                        ? `<p><strong>语义段落：</strong>${escapeHtml(todo.semantic_segment_id)}${todo.why_this_segment ? ` · ${escapeHtml(todo.why_this_segment)}` : ""}</p>`
+                        : `<p><strong>语义段落：</strong>系统会优先定位到相关正文段落组</p>`
+                    }
+                    <p><strong>推荐结构：</strong>${escapeHtml(todo.recommended_structure || "关键信息 + 判断依据 + 示例")}</p>
+                    <div class="summary-actions">
+                      <span class="chip">${escapeHtml(todo.status === "preview_generated" ? "已生成预览" : "待处理")}</span>
+                      ${
+                        todo.source_block_ids?.[0]
+                          ? `<button type="button" data-optimize-block="${escapeHtml(todo.source_block_ids[0])}">定位原文依据</button>`
+                          : ""
+                      }
+                    </div>
+                  </article>`,
+              )
+              .join("")}
+          </div>
+          <div class="summary-actions">
+            <button id="generatePreviewButton" type="button" ${state.optimizationPreviewGenerating || !(plan.todos || []).length ? "disabled" : ""}>
+              ${state.optimizationPreviewGenerating ? "正在生成预览..." : errorMessage ? "重试生成预览" : "生成预览"}
+            </button>
+            <span class="chip">预览只生成候选补充内容，不会自动覆盖原文</span>
+          </div>
+        </section>`;
+      }
+
+      function scrollToActiveBlock() {
+        if (!state.activeBlock) return;
+        document.getElementById("block-" + state.activeBlock)?.scrollIntoView({
+          block: "center",
+          behavior: "smooth",
+        });
+      }
+
+      function renderTagNavigator() {
+        const root = document.getElementById("navigatorRoot");
+        const payload = state.payload;
+        if (!payload) {
+          root.className = "empty";
+          root.textContent = "暂无可展示的标签导航。";
+          return;
+        }
+        const allGroups = fieldEvidenceGroups(payload);
+        const visibleGroups = allGroups.filter((group) => {
+          if (state.showMissingOnly && group.field.status === "covered") return false;
+          if (state.focusCurrentUnitOnly && state.activeSemanticUnitId) {
+            return group.units.some((unit) => unit.unit_id === state.activeSemanticUnitId);
+          }
+          return true;
+        });
+        root.className = "navigator-root";
+        root.innerHTML = `
+          <section class="navigator-header">
+            <span class="kicker">按文档要素导航</span>
+            <h2>标签到段落</h2>
+            <p>从业务标签反查相关语义单元和原文片段，先看结构，再回到原文。</p>
+            <div class="navigator-actions">
+              <button type="button" class="${state.showMissingOnly ? "active" : ""}" data-toggle-missing>只看待补强</button>
+              <button type="button" class="${state.focusCurrentUnitOnly ? "active" : ""}" data-toggle-current-unit ${state.activeSemanticUnitId ? "" : "disabled"}>只看当前语义单元</button>
+              <button type="button" class="${state.navigatorExpanded ? "active" : ""}" data-toggle-navigator-view>${state.navigatorExpanded ? "收起标签导航" : "展开标签导航"}</button>
+              <span class="chip">拖拽调整宽度</span>
+            </div>
+          </section>
+          <section class="field-tree">
+            ${visibleGroups
+              .map((group) => {
+                const field = group.field;
+                const activeField = state.activeField === field.field_key;
+                return `<article class="field-node ${activeField ? "active" : ""}">
+                  <button type="button" class="field ${field.status} ${activeField ? "active" : ""}" data-nav-field="${escapeHtml(field.field_key)}">
+                    <strong>${escapeHtml(field.label)}</strong>
+                    <span class="chip">${escapeHtml(fieldStatusLabels[field.status] || field.status)}</span>
+                    <p>${escapeHtml(field.reason)}</p>
+                    <p>相关语义单元 ${group.units.length} 组 · 关联原文片段 ${group.evidence_count} 处</p>
+                  </button>
+                  ${
+                    group.units.length
+                      ? group.units
+                          .map(
+                            (unit) =>
+                              `<button type="button" class="unit-node ${state.activeSemanticUnitId === unit.unit_id ? "active" : ""}" data-nav-unit="${escapeHtml(unit.unit_id)}" data-nav-field-for-unit="${escapeHtml(field.field_key)}">
+                                <strong>相关语义单元 · ${escapeHtml(unit.unit_id)}</strong>
+                                <span>${escapeHtml(unit.summary)}</span>
+                                ${unit.continuity_reason ? `<span>合并原因：${escapeHtml(unit.continuity_reason)}</span>` : ""}
+                                <span>这组段落共同支持的文档要素：${escapeHtml(field.label)}</span>
+                                <span>关联原文片段：${unit.source_block_ids.map((blockId) => escapeHtml(blockId)).join("、")}</span>
+                              </button>`,
+                          )
+                          .join("")
+                      : `<p>这个标签暂未形成语义单元，下面按原文片段定位。</p>`
+                  }
+                  ${
+                    group.fallbackBlocks.length
+                      ? group.fallbackBlocks
+                          .map(
+                            (block) =>
+                              `<button type="button" class="block-node" data-nav-block="${escapeHtml(block.block_id)}" data-nav-field-for-block="${escapeHtml(field.field_key)}">
+                                <strong>${escapeHtml(block.source_span || block.block_id)}</strong>
+                                <span>${escapeHtml(block.text_content).slice(0, 80)}</span>
+                              </button>`,
+                          )
+                          .join("")
+                      : ""
+                  }
+                </article>`;
+              })
+              .join("")}
+          </section>
+        `;
+        root.querySelectorAll("[data-toggle-missing]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.showMissingOnly = !state.showMissingOnly;
+            renderAll();
+          });
+        });
+        root.querySelectorAll("[data-toggle-current-unit]").forEach((node) => {
+          node.addEventListener("click", () => {
+            if (!state.activeSemanticUnitId) return;
+            state.focusCurrentUnitOnly = !state.focusCurrentUnitOnly;
+            renderAll();
+          });
+        });
+        root.querySelectorAll("[data-toggle-navigator-view]").forEach((node) => {
+          node.addEventListener("click", toggleNavigatorView);
+        });
+        root.querySelectorAll("[data-nav-field]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.activeField = node.getAttribute("data-nav-field");
+            const group = allGroups.find((item) => item.field.field_key === state.activeField);
+            const firstUnit = group?.units[0];
+            state.activeSemanticUnitId = firstUnit?.unit_id || null;
+            state.activeBlock = firstUnit?.source_block_ids?.[0] || group?.fallbackBlocks[0]?.block_id || null;
+            renderAll();
+            scrollToActiveBlock();
+          });
+        });
+        root.querySelectorAll("[data-nav-unit]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.activeSemanticUnitId = node.getAttribute("data-nav-unit");
+            state.activeField = node.getAttribute("data-nav-field-for-unit") || state.activeField;
+            const unit = semanticUnitById(state.activeSemanticUnitId);
+            state.activeBlock = unit?.source_block_ids?.[0] || state.activeBlock;
+            renderAll();
+            scrollToActiveBlock();
+          });
+        });
+        root.querySelectorAll("[data-nav-block]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.activeBlock = node.getAttribute("data-nav-block");
+            state.activeField = node.getAttribute("data-nav-field-for-block") || state.activeField;
+            state.activeSemanticUnitId = annotationForBlock(state.activeBlock).semantic_unit_id || null;
+            renderAll();
+            scrollToActiveBlock();
+          });
+        });
+      }
+
+      function renderSource() {
+        const root = document.getElementById("sourceRoot");
+        const payload = state.payload;
+        if (!payload) {
+          root.className = "empty";
+          root.textContent = "暂无可展示的批改记录。请先生成一次文档批改结果。";
+          return;
+        }
+        const blocks = payload.document.blocks;
+        const uncoveredCount = payload.schema_fields.filter((field) => field.status !== "covered").length;
+        root.className = "";
+        root.innerHTML = `
+          <section class="source-header">
+            <div>
+              <span class="kicker">原文阅读器</span>
+              <h2>${escapeHtml(payload.document_summary.document_theme)}</h2>
+              <p>左侧保持原文阅读，中间按文档要素导航到相关语义单元和段落。</p>
+            </div>
+            <div class="stats">
+              <strong>${blocks.length}</strong><span>片段数</span>
+              <strong>${payload.block_annotations?.length || 0}</strong><span>已判断作用</span>
+              <strong>${uncoveredCount}</strong><span>待补强字段</span>
+            </div>
+          </section>
+          <section class="reading-flow">
+            ${blocks
+              .map((block, index) => {
+                const tags = tagsForBlock(block.block_id);
+                const annotation = annotationForBlock(block.block_id);
+                const supportingRefs = annotation.supporting_field_refs || [];
+                const unitSupportingRefs = unitTagsForBlock(block.block_id);
+                const activeAnnotation = state.activeBlock ? annotationForBlock(state.activeBlock) : null;
+                const sameSemanticUnit =
+                  annotation.semantic_unit_id &&
+                  (activeAnnotation?.semantic_unit_id === annotation.semantic_unit_id ||
+                    state.activeSemanticUnitId === annotation.semantic_unit_id);
+                const linked = state.activeField
+                  ? [...supportingRefs, ...unitSupportingRefs].some((tag) => tag.field_key === state.activeField)
+                  : false;
+                const unitNote =
+                  annotation.semantic_unit_id
+                    ? `<div class="semantic-unit-note">
+                        <strong>同一语义单元</strong>
+                        <p>${escapeHtml(annotation.semantic_unit_summary || "这几个原文片段共同表达一个完整意思。")}</p>
+                        ${
+                          annotation.continuity_reason
+                            ? `<p><strong>合并原因：</strong>${escapeHtml(annotation.continuity_reason)}</p>`
+                            : ""
+                        }
+                      </div>`
+                    : "";
+                return `<article id="block-${escapeHtml(block.block_id)}" class="block ${state.activeBlock === block.block_id ? "active" : ""} ${linked ? "linked" : ""} ${sameSemanticUnit ? "unit-linked" : ""}" data-block-id="${escapeHtml(block.block_id)}">
+                  <div class="block-meta">
+                    <span class="chip">${escapeHtml(blockTypeLabels[block.block_type] || "片段")}</span>
+                    <span class="chip">${escapeHtml(block.source_span ? "位置 " + block.source_span : "第 " + (index + 1) + " 段")}</span>
+                    ${
+                      annotation.semantic_unit_id
+                        ? `<span class="chip">同一语义单元 · ${escapeHtml(annotation.semantic_unit_source_block_ids?.join(" + ") || annotation.semantic_unit_id)}</span>`
+                        : ""
+                    }
+                  </div>
+                  <div class="block-body">
+                    <div class="block-content">${renderBlockContent(block)}${unitNote}</div>
+                    <div class="tag-list">
+                      <button type="button" class="tag covered" data-block-focus="${escapeHtml(block.block_id)}">
+                        <strong>片段作用：${escapeHtml(annotation.primary_label)}</strong>
+                        <span>${escapeHtml(roleDescriptions[annotation.primary_role] || roleDescriptions.unknown)}</span>
+                      </button>
+                    </div>
+                  </div>
+                </article>`;
+              })
+              .join("")}
+          </section>
+        `;
+        root.querySelectorAll("[data-block-id]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.activeBlock = node.getAttribute("data-block-id");
+            state.activeSemanticUnitId = annotationForBlock(state.activeBlock).semantic_unit_id || null;
+            const tag = unitTagsForBlock(state.activeBlock)[0] || tagsForBlock(state.activeBlock)[0];
+            if (tag) state.activeField = tag.field_key;
+            renderAll();
+          });
+        });
+        root.querySelectorAll("[data-field-key]").forEach((node) => {
+          node.addEventListener("click", (event) => {
+            event.stopPropagation();
+            state.activeField = node.getAttribute("data-field-key");
+            const field = payload.schema_fields.find((item) => item.field_key === state.activeField);
+            state.activeBlock = field?.source_block_ids?.[0] || state.activeBlock;
+            renderAll();
+          });
+        });
+        root.querySelectorAll("[data-block-focus]").forEach((node) => {
+          node.addEventListener("click", (event) => {
+            event.stopPropagation();
+            state.activeBlock = node.getAttribute("data-block-focus");
+            state.activeSemanticUnitId = annotationForBlock(state.activeBlock).semantic_unit_id || null;
+            renderAll();
+          });
+        });
+      }
+
+      function renderReview() {
+        const root = document.getElementById("reviewRoot");
+        const payload = state.payload;
+        if (!payload) {
+          root.className = "empty";
+          root.textContent = "暂无批改数据。";
+          return;
+        }
+        const summary = payload.document_summary;
+        const activeAnnotation = state.activeBlock ? annotationForBlock(state.activeBlock) : null;
+        const activeField = payload.schema_fields.find((field) => field.field_key === state.activeField);
+        const activeUnit =
+          semanticUnitById(state.activeSemanticUnitId) ||
+          semanticUnitById(activeAnnotation?.semantic_unit_id);
+        const activeFieldGroup = fieldEvidenceGroups(payload).find(
+          (group) => group.field.field_key === state.activeField,
+        );
+        const summaryObservability = payload.expert_summary_observability;
+        const optimizationPlan = payload.one_click_optimization_plan;
+        const optimizationError = payload.one_click_optimization_error;
+        const optimization = payload.one_click_optimization;
+        const optimizationPlanObservability = optimizationPlan?.observability;
+        const optimizationObservability = payload.one_click_optimization_observability;
+        const activeObservability =
+          state.llmDrawerSource === "one_click_optimization"
+            ? optimizationObservability
+            : state.llmDrawerSource === "optimization_plan"
+              ? optimizationPlanObservability
+            : summaryObservability;
+        const drawerTitle =
+          state.llmDrawerSource === "one_click_optimization"
+            ? "一键优化生成过程"
+            : state.llmDrawerSource === "optimization_plan"
+              ? "LLM 计划生成过程"
+            : "专家摘要生成过程";
+        const drawerEmptyText =
+          state.llmDrawerSource === "one_click_optimization"
+            ? "请先生成优化预览，系统会在这里展示调用模型、提示词和返回结果。"
+            : state.llmDrawerSource === "optimization_plan"
+              ? "请先点击“一键优化”，系统会在这里展示语义段落 shortlist、LLM 提示词、原始返回和 fallback 原因。"
+            : "请先点击“生成专家摘要”，系统会在这里展示调用模型、提示词和返回结果。";
+        const drawerOptions =
+          state.llmDrawerSource === "optimization_plan"
+            ? {
+                kicker: "计划推理过程",
+                systemLabel: "计划推理过程",
+                inputLabel: "语义单元、语义段落与规则输入",
+                outputLabel: "LLM 计划生成 / 计划输出",
+                parsedLabel: "计划结构与 fallback 原因",
+                extraDebugSection: renderContinuityTraceSection(payload.continuity_decision_trace),
+              }
+            : {};
+        root.className = "";
+        root.innerHTML = `
+          <section class="card">
+            <header>
+              <div><span class="kicker">当前选择详情</span><h2>${escapeHtml(activeField?.label || activeUnit?.unit_id || activeAnnotation?.primary_label || "请选择标签或段落")}</h2></div>
+              ${activeField ? `<span class="chip">${escapeHtml(fieldStatusLabels[activeField.status] || activeField.status)}</span>` : ""}
+            </header>
+            ${
+              activeField
+                ? `<p>${escapeHtml(activeField.reason)}</p>
+                   <p>相关语义单元 ${activeFieldGroup?.units.length ?? 0} 组 · 关联原文片段 ${activeFieldGroup?.evidence_count ?? activeField.source_block_ids.length} 处。</p>`
+                : activeUnit
+                  ? `<p>${escapeHtml(activeUnit.summary || "这组段落共同表达一个完整意思。")}</p>
+                     <p>${escapeHtml(activeAnnotation?.continuity_reason || "系统将这些相邻原文片段识别为同一语义单元。")}</p>`
+                  : `<p>从中间栏选择一个文档要素、语义单元或原文片段，右侧会展示对应证据和建议。</p>`
+            }
+            ${
+              activeUnit?.source_block_ids?.length
+                ? `<div class="summary-actions">${activeUnit.source_block_ids.map((blockId) => `<button type="button" data-optimize-block="${escapeHtml(blockId)}">定位 ${escapeHtml(blockId)}</button>`).join("")}</div>`
+                : ""
+            }
+          </section>
+          ${
+            activeAnnotation
+              ? `<section class="card">
+                  <header><div><span class="kicker">当前片段在文档中的作用</span><h2>${escapeHtml(activeAnnotation.primary_label)}</h2></div></header>
+                  <p>${escapeHtml(roleDescriptions[activeAnnotation.primary_role] || roleDescriptions.unknown)}</p>
+                  <p>系统判断这个片段主要承担“${escapeHtml(activeAnnotation.primary_label)}”的作用。专家可以用它来核对下方文档要素是否表达准确。</p>
+                  <div class="field-list">
+                    ${
+                      activeAnnotation.supporting_field_refs.length
+                        ? activeAnnotation.supporting_field_refs
+                            .map(
+                              (ref) =>
+                                `<button type="button" class="field ${ref.status}" data-review-field="${escapeHtml(ref.field_key)}"><strong>${escapeHtml(ref.label)}</strong><span class="chip">${escapeHtml(tagStatusLabels[ref.status] || ref.status)}</span><p>这个片段可作为“${escapeHtml(ref.label)}”的参考依据。${escapeHtml((ref.sources || []).map((source) => sourceLabels[source] || "系统引用").join("、"))}</p></button>`,
+                            )
+                            .join("")
+                        : `<p>这个片段暂未直接支持某个文档要素，建议只作为上下文阅读。</p>`
+                    }
+                  </div>
+                </section>`
+              : ""
+          }
+          <section class="card">
+            <header>
+              <div><span class="kicker">这篇文档主要讲什么</span><h2>${escapeHtml(summary.document_theme)}</h2></div>
+              <span class="chip">${summary.expert_summary_status === "llm_generated" ? "专家摘要已生成" : "默认摘要"}</span>
+            </header>
+            <p>${escapeHtml(summary.core_idea || summary.summary_for_agent)}</p>
+            <div class="summary-actions">
+              <button id="expertSummaryButton" type="button" ${state.summaryGenerating ? "disabled" : ""}>${state.summaryGenerating ? "正在生成专家摘要..." : "生成专家摘要"}</button>
+              <button id="oneClickOptimizeButton" type="button" ${state.optimizationGenerating ? "disabled" : ""}>${state.optimizationGenerating ? "正在生成优化计划..." : optimizationPlan ? "重新生成优化计划" : "一键优化"}</button>
+              <button id="llmDebugButton" type="button">查看LLM调用</button>
+              <span class="chip">可选：用大模型改写成更像专家批语的摘要</span>
+            </div>
+            <div class="summary-grid">
+              <div class="mini-card"><span class="kicker">业务场景</span><strong>${escapeHtml(summary.business_scene || "待确认")}</strong></div>
+              <div class="mini-card"><span class="kicker">核心目标</span><strong>${escapeHtml(summary.primary_goal || "待补充")}</strong></div>
+            </div>
+            <div>
+              <span class="kicker">方法主线</span>
+              <p>系统判断这篇文档的组织方式，帮助你快速看清它是否像一套可执行的方法论。</p>
+              <ol class="method-list">${(summary.method_spine || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol>
+            </div>
+            <div>
+              <span class="kicker">专家批语</span>
+              <p>${escapeHtml(summary.expert_commentary || "建议从完整度、可执行性和可验证性三个角度继续检查。")}</p>
+            </div>
+            <div class="risk-list">${(summary.review_focuses || []).map((item) => `<span class="chip">${escapeHtml(item)}</span>`).join("")}</div>
+          </section>
+
+          ${renderOptimizationPlan(optimizationPlan, optimizationError)}
+
+          ${
+            optimization
+              ? `<section class="card">
+                  <header>
+                    <div><span class="kicker">优化建议预览</span><h3>${escapeHtml(optimization.goal || "一键优化建议")}</h3></div>
+                    <button type="button" data-open-optimize-debug>查看LLM调用</button>
+                  </header>
+                  <p>${escapeHtml(optimization.summary || "以下内容是待专家审阅的优化草稿，不会自动覆盖原文。")}</p>
+                  <div>
+                    ${(optimization.patches || [])
+                      .map(
+                        (patch) =>
+                          `<article class="patch-card">
+                            <header>
+                              <strong>${escapeHtml(patch.title)}</strong>
+                              <span class="chip">${escapeHtml(patch.target_field_label || "待确认要素")}</span>
+                            </header>
+                            <blockquote>${escapeHtml(patch.draft_text)}</blockquote>
+                            <p><strong>优化目标：</strong>${escapeHtml(patch.rationale || "补强当前文档表达。")}</p>
+                            <p><strong>预计改善：</strong>${escapeHtml(patch.expected_improvement || "提升文档完整度。")}</p>
+                            <div class="summary-actions">
+                              <span class="chip">${escapeHtml(patch.status === "preview" ? "待专家确认" : "需人工复核")}</span>
+                              ${
+                                patch.suggested_location?.block_id || patch.source_block_ids?.[0]
+                                  ? `<button type="button" data-optimize-block="${escapeHtml(patch.suggested_location?.block_id || patch.source_block_ids?.[0])}">定位原文依据</button>`
+                                  : ""
+                              }
+                            </div>
+                          </article>`,
+                      )
+                      .join("")}
+                  </div>
+                </section>`
+              : ""
+          }
+
+          <section class="card">
+            <header>
+              <div><span class="kicker">文档要素检查</span><h3>${payload.schema_fields.filter((field) => field.status === "covered").length} / ${payload.schema_fields.length} 已说明</h3></div>
+            </header>
+            <div class="field-list">
+              ${payload.schema_fields
+                .map(
+                  (field) =>
+                    `<button type="button" class="field ${field.status} ${state.activeField === field.field_key ? "active" : ""}" data-review-field="${escapeHtml(field.field_key)}">
+                      <strong>${escapeHtml(field.label)}</strong>
+                      <span class="chip">${escapeHtml(fieldStatusLabels[field.status] || field.status)}</span>
+                      <p>${escapeHtml(field.reason)}</p>
+                      <p>引用依据 ${field.source_count} 处 · 已识别内容 ${field.item_count} 条${field.required ? " · 核心要素" : ""}${field.critical ? " · 重点检查" : ""}</p>
+                    </button>`,
+                )
+                .join("")}
+            </div>
+          </section>
+
+          <section class="card">
+            <header><div><span class="kicker">建议专家补充</span><h3>${payload.hints.length} 条建议</h3></div></header>
+            ${
+              payload.hints.length
+                ? payload.hints
+                    .map(
+                      (hint) =>
+                        `<article class="hint">
+                          <header><strong>${escapeHtml(hint.label)}</strong><span class="chip">${escapeHtml(priorityLabels[hint.priority] || "建议补充")}</span></header>
+                          <p>${escapeHtml(hint.why_it_matters)}</p>
+                          <p><strong>建议追问：</strong>${escapeHtml(hint.what_to_ask)}</p>
+                          <p><strong>推荐结构：</strong>${escapeHtml(hint.recommended_structure)}</p>
+                        </article>`,
+                    )
+                    .join("")
+                : `<p>暂未发现高优先级缺口。</p>`
+            }
+          </section>
+
+          <section class="card">
+            <header><div><span class="kicker">第一阶段评估</span><h3>这篇文档目前好在哪里，还缺什么</h3></div></header>
+            <div class="metric-grid">${(payload.friendly_evaluation?.items || [])
+              .map(
+                (item) =>
+                  `<div class="metric"><span class="kicker">${escapeHtml(item.status)}</span><strong>${escapeHtml(item.label)} · ${escapeHtml(item.value_text)}</strong><small>${escapeHtml(item.explanation)}</small><p>${escapeHtml(item.action)}</p></div>`,
+              )
+              .join("")}</div>
+            <details class="debug-details">
+              <summary>查看详细评估依据</summary>
+              <div class="metric-grid">${payload.evaluation.metrics
+                .map(
+                  (metric) =>
+                    `<div class="metric"><span class="kicker">${escapeHtml(metricStatusText(metric.status))}</span><strong>${escapeHtml(metric.label)} · ${escapeHtml(metricValueText(metric.value))}</strong><small>${escapeHtml(metricExplanation(metric))}</small></div>`,
+                )
+                .join("")}</div>
+            </details>
+          </section>
+          ${renderLlmDrawer(activeObservability, drawerTitle, drawerEmptyText, drawerOptions)}
+        `;
+        const summaryButton = document.getElementById("expertSummaryButton");
+        const optimizeButton = document.getElementById("oneClickOptimizeButton");
+        const generatePreviewButton = document.getElementById("generatePreviewButton");
+        const llmDebugButton = document.getElementById("llmDebugButton");
+        llmDebugButton?.addEventListener("click", () => {
+          state.llmDrawerSource = "expert_summary";
+          state.llmDrawerOpen = true;
+          renderAll();
+        });
+        root.querySelectorAll("[data-open-optimize-debug]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.llmDrawerSource = "one_click_optimization";
+            state.llmDrawerOpen = true;
+            renderAll();
+          });
+        });
+        root.querySelectorAll("[data-open-plan-debug]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.llmDrawerSource = "optimization_plan";
+            state.llmDrawerOpen = true;
+            renderAll();
+          });
+        });
+        root.querySelectorAll("[data-close-llm-drawer]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.llmDrawerOpen = false;
+            renderAll();
+          });
+        });
+        root.querySelectorAll("[data-drawer-backdrop]").forEach((node) => {
+          node.addEventListener("click", (event) => {
+            if (event.target === node) {
+              state.llmDrawerOpen = false;
+              renderAll();
+            }
+          });
+        });
+        summaryButton?.addEventListener("click", async () => {
+          if (!state.selectedRunId || state.summaryGenerating) return;
+          state.summaryGenerating = true;
+          renderAll();
+          try {
+            const data = await fetchJson(`/api/runs/${encodeURIComponent(state.selectedRunId)}/expert-summary`, {
+              method: "POST",
+            });
+            state.payload = data.review_workbench;
+            state.llmDrawerSource = "expert_summary";
+            state.llmDrawerOpen = true;
+          } catch (err) {
+            alert("专家摘要生成失败：" + (err instanceof Error ? err.message : String(err)));
+          } finally {
+            state.summaryGenerating = false;
+            renderAll();
+          }
+        });
+        optimizeButton?.addEventListener("click", async () => {
+          if (!state.selectedRunId || state.optimizationGenerating) return;
+          state.optimizationGenerating = true;
+          state.optimizationClientError = "";
+          renderAll();
+          try {
+            const data = await fetchJson(
+              `/api/runs/${encodeURIComponent(state.selectedRunId)}/one-click-optimize-plan`,
+              {
+                method: "POST",
+              },
+            );
+            state.payload = data.review_workbench;
+          } catch (err) {
+            state.optimizationClientError = err instanceof Error ? err.message : String(err);
+          } finally {
+            state.optimizationGenerating = false;
+            renderAll();
+          }
+        });
+        generatePreviewButton?.addEventListener("click", async () => {
+          if (!state.selectedRunId || state.optimizationPreviewGenerating) return;
+          state.optimizationPreviewGenerating = true;
+          state.optimizationClientError = "";
+          renderAll();
+          try {
+            const data = await fetchJson(`/api/runs/${encodeURIComponent(state.selectedRunId)}/one-click-optimize`, {
+              method: "POST",
+            });
+            state.payload = data.review_workbench;
+            if (state.payload?.one_click_optimization_observability) {
+              state.llmDrawerSource = "one_click_optimization";
+              state.llmDrawerOpen = true;
+            }
+            if (data.error && !state.payload?.one_click_optimization_error) {
+              state.optimizationClientError = data.message || "生成预览失败，请稍后重试。";
+            }
+          } catch (err) {
+            state.optimizationClientError = err instanceof Error ? err.message : String(err);
+          } finally {
+            state.optimizationPreviewGenerating = false;
+            renderAll();
+          }
+        });
+        root.querySelectorAll("[data-optimize-block]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.activeBlock = node.getAttribute("data-optimize-block");
+            state.activeSemanticUnitId = annotationForBlock(state.activeBlock).semantic_unit_id || null;
+            renderAll();
+            scrollToActiveBlock();
+          });
+        });
+        root.querySelectorAll("[data-review-field]").forEach((node) => {
+          node.addEventListener("click", () => {
+            state.activeField = node.getAttribute("data-review-field");
+            const group = fieldEvidenceGroups(payload).find((item) => item.field.field_key === state.activeField);
+            const firstUnit = group?.units[0];
+            state.activeSemanticUnitId = firstUnit?.unit_id || null;
+            state.activeBlock = firstUnit?.source_block_ids?.[0] || group?.fallbackBlocks[0]?.block_id || null;
+            renderAll();
+            scrollToActiveBlock();
+          });
+        });
+      }
+
+      function renderRunSelect() {
+        const select = document.getElementById("runSelect");
+        select.innerHTML = state.runs
+          .map(
+            (run) =>
+              `<option value="${escapeHtml(run.run_id)}" ${run.run_id === state.selectedRunId ? "selected" : ""}>${escapeHtml(run.run_id)}${run.scene_name ? " · " + escapeHtml(run.scene_name) : ""}</option>`,
+          )
+          .join("");
+      }
+
+      function renderAll() {
+        applyLayoutState();
+        renderSource();
+        renderTagNavigator();
+        renderReview();
+      }
+
+      async function loadSelectedRun() {
+        if (!state.selectedRunId) return;
+        state.payload = await fetchJson(`/api/runs/${encodeURIComponent(state.selectedRunId)}/review-workbench`);
+        state.activeField = state.payload.hints[0]?.field_key || state.payload.schema_fields.find((field) => field.status !== "covered")?.field_key || null;
+        const firstGroup = fieldEvidenceGroups(state.payload).find((group) => group.field.field_key === state.activeField);
+        state.activeSemanticUnitId = firstGroup?.units[0]?.unit_id || null;
+        state.activeBlock = firstGroup?.units[0]?.source_block_ids?.[0] || firstGroup?.fallbackBlocks[0]?.block_id || null;
+        renderRunSelect();
+        renderAll();
+      }
+
+      async function loadRuns() {
+        const data = await fetchJson("/api/runs");
+        state.runs = data.runs || [];
+        if (!state.selectedRunId) state.selectedRunId = state.runs[0]?.run_id || null;
+        renderRunSelect();
+        await loadSelectedRun();
+      }
+
+      document.getElementById("runSelect").addEventListener("change", (event) => {
+        state.selectedRunId = event.target.value;
+        const url = new URL(location.href);
+        url.searchParams.set("run_id", state.selectedRunId);
+        history.replaceState(null, "", url);
+        void loadSelectedRun();
+      });
+
+      document.getElementById("reloadButton").addEventListener("click", () => {
+        void loadRuns();
+      });
+
+      initResizableLayout();
+      applyLayoutState();
+
+      loadRuns().catch((err) => {
+        document.getElementById("sourceRoot").className = "empty";
+        document.getElementById("sourceRoot").textContent = "加载失败：" + err.message;
+        document.getElementById("reviewRoot").className = "empty";
+        document.getElementById("reviewRoot").textContent = "请确认已经生成文档批改结果。";
+      });
+    </script>
+  </body>
+</html>
